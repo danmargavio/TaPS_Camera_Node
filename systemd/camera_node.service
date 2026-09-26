@@ -1,0 +1,33 @@
+[Unit]
+Description=TaPS Camera Node
+After=network.target chrony.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/camera_node \
+    --camera 0 \
+    --fps 60 \
+    --width 1920 \
+    --height 1080 \
+    --fourcc MJPG \
+    --output /recordings \
+    --encoder jpeg \
+    --encoder-args "quality:85" \
+    --encoder-threads 4 \
+    --http-port 8080 \
+    --stream-quality 85 \
+    --stream-width 640 \
+    --stream-height 480 \
+    --stream-fps 15 \
+    --pps-gpio 17 \
+    --nt-server 10.0.1.X \
+    --nt-match-start RoboRIO/matchStart \
+    --nt-match-end RoboRIO/matchEnd \
+    --nt-local CameraNode1
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
