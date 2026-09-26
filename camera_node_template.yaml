@@ -1,0 +1,35 @@
+# TaPS CameraNode Configuration Template
+# Copy this file to camera_node.yaml and edit for your setup.
+
+camera:
+  device_id: 0          # /dev/video0
+  width: 1920           # Frame width in pixels
+  height: 1080          # Frame height in pixels
+  fps: 60               # Target frame rate
+  fourcc: "MJPG"        # Codec: MJPG, YUYV, H264, NV12, YUV420P
+
+recording:
+  output_dir: "/recordings"
+  encoder: "jpeg"       # jpeg or raw
+  quality: 85           # JPEG quality (0-100)
+  encoder_threads: 4    # Parallel encoding threads
+
+streaming:
+  http_port: 8080       # HTTP server port
+  preview_width: 640    # Grid preview width
+  preview_height: 480   # Grid preview height
+  preview_fps: 15       # Grid preview frame rate
+  jpeg_quality: 85      # MJPEG stream quality
+  compose_grid: true    # Serve 2x2 grid at /grid-stream
+
+pps:
+  gpio_pin: 17          # GPIO pin for 1 PPS signal (-1 = disabled)
+
+network_tables:
+  server: "10.0.1.X"    # RoboRIO NetworkTables IP address
+  match_start_topic: "RoboRIO/matchStart"
+  match_end_topic: "RoboRIO/matchEnd"
+
+identity:
+  name: "CameraNode1"   # Unique name for this node (CameraNode1-4)
+  index: 1              # Node index (1-4)
