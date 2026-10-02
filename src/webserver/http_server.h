@@ -29,6 +29,7 @@
 #include "../video_recorder.h"
 #include "../video_queue.h"
 #include "../taps_reader/taps_reader.h"
+#include "calibration.h"
 
 using namespace httpserver;
 using json = nlohmann::json;
@@ -65,6 +66,12 @@ public:
         s_ws->register_path("/", std::make_unique<IndexResource>());
         s_ws->register_path("/playback", std::make_unique<PlaybackResource>());
 
+        // Camera calibration wizard (guided focus test + checkerboard capture)
+        s_ws->register_path("/calibrate", std::make_unique<CalibratePageResource>());
+        s_ws->register_path("/calib/status", std::make_unique<CalibStatusResource>());
+        s_ws->register_path("/calib/control", std::make_unique<CalibControlResource>());
+        s_ws->register_path("/calib/stream", std::make_unique<CalibStreamResource>());
+
         // Start the frame → JPEG pump
         s_running = true;
         s_encodeThread = std::thread(encodeLoop);
@@ -90,6 +97,7 @@ public:
     }
 
     static void stop() {
+        CalibrationSession::shutdown();
         VideoRecordThread::setStateCallback(nullptr);
 
         s_running = false;
@@ -285,6 +293,9 @@ private:
         while (s_running) {
             const auto maybe = s_frameBuffer->pop();
             if (!maybe) continue;
+
+            // Feed full-resolution frames to the calibration wizard (no-op when idle)
+            CalibrationSession::submitFrame(maybe->frame);
 
             auto now = std::chrono::steady_clock::now();
             auto wallNow = std::chrono::system_clock::now();
@@ -637,6 +648,106 @@ private:
 
     private:
         struct ProducerState {
+            std::string part;
+            std::size_t offset = 0;
+            uint64_t lastSeq = 0;
+        };
+    };
+
+    // --- Camera calibration wizard resources ---------------------------------
+
+    class CalibratePageResource : public http_resource {
+    public:
+        http_response render_get(const http_request &) override {
+            return http_response::file("templates/calibrate.html")
+                    .with_header("Content-Type", "text/html");
+        }
+    };
+
+    class CalibStatusResource : public http_resource {
+    public:
+        http_response render_get(const http_request &) override {
+            return jsonResponse(CalibrationSession::statusJson());
+        }
+    };
+
+    class CalibControlResource : public http_resource {
+    public:
+        http_response render_post(const http_request &req) override {
+            json parsed;
+            try {
+                parsed = json::parse(std::string(req.get_content()));
+            } catch (const json::parse_error &e) {
+                spdlog::warn("HTTP: malformed /calib/control body: {}", e.what());
+                return errorResponse("invalid JSON body");
+            }
+            if (parsed.value("action", "") == "start" &&
+                VideoRecordThread::getState() != VideoRecordThread::RecorderState::Idle) {
+                return errorResponse("recording/saving in progress - stop recording before calibrating");
+            }
+            return jsonResponse(CalibrationSession::control(parsed));
+        }
+    };
+
+    // MJPEG stream of the calibration wizard view (live overlays drawn server-side)
+    class CalibStreamResource : public http_resource {
+    public:
+        http_response render_get(const http_request &) override {
+            auto state = std::make_shared<CalibProducerState>();
+
+            auto producer = [state](std::uint64_t, char *buf, const std::size_t max) -> ssize_t {
+                if (state->offset < state->part.size()) {
+                    const std::size_t avail = state->part.size() - state->offset;
+                    const std::size_t n = std::min(avail, max);
+                    std::memcpy(buf, state->part.data() + state->offset, n);
+                    state->offset += n;
+                    return static_cast<ssize_t>(n);
+                }
+
+                if (!s_running.load()) return -1;
+
+                uint64_t seq = CalibrationSession::s_jpegSequence.load(std::memory_order_relaxed);
+                for (int i = 0; i < 100 && seq == state->lastSeq; ++i) {
+                    if (!s_running.load()) return -1;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    seq = CalibrationSession::s_jpegSequence.load(std::memory_order_relaxed);
+                }
+                state->lastSeq = seq;
+
+                std::vector<uint8_t> jpeg;
+                {
+                    std::lock_guard<std::mutex> lock(CalibrationSession::s_jpegMutex);
+                    jpeg = CalibrationSession::s_latestJpeg;
+                }
+
+                state->part.clear();
+                if (jpeg.empty()) {
+                    state->part = "--frame\r\nContent-Type: text/plain\r\n\r\nwaiting\r\n";
+                } else {
+                    state->part.reserve(jpeg.size() + 128);
+                    state->part += "--frame\r\n";
+                    state->part += "Content-Type: image/jpeg\r\n";
+                    state->part += "Content-Length: " + std::to_string(jpeg.size()) + "\r\n\r\n";
+                    state->part.append(reinterpret_cast<const char *>(jpeg.data()), jpeg.size());
+                    state->part += "\r\n";
+                }
+                state->offset = 0;
+
+                const std::size_t n = std::min(state->part.size(), max);
+                std::memcpy(buf, state->part.data(), n);
+                state->offset = n;
+                return static_cast<ssize_t>(n);
+            };
+
+            return http_response::deferred(std::move(producer))
+                    .with_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                    .with_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                    .with_header("Pragma", "no-cache")
+                    .with_header("Connection", "close");
+        }
+
+    private:
+        struct CalibProducerState {
             std::string part;
             std::size_t offset = 0;
             uint64_t lastSeq = 0;

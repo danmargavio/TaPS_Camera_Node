@@ -53,6 +53,23 @@ struct RuntimeArgs {
     bool composeGrid = true; // Compose 2x2 grid for /grid-stream endpoint
     unsigned short gridPreviewWidth = 640;
     unsigned short gridPreviewHeight = 480;
+
+    // AprilTag detection settings (NEW)
+    bool apriltagEnabled = false;
+    std::string apriltagFamily = "tag36h11";
+    int apriltagThreads = 1;
+    double apriltagQuadDecimation = 2.0;   // 1..4, higher = faster/coarser
+    double apriltagBlur = 0.0;             // -1 = auto, 0 = none
+    bool apriltagEstimatePose = true;
+    double apriltagTagSizeMeters = 0.165;  // physical tag edge length
+    double apriltagFx = 0.0;               // 0 = derive default (f = width)
+    double apriltagFy = 0.0;
+    double apriltagCx = 0.0;               // 0 = derive default (image center)
+    double apriltagCy = 0.0;
+    std::string cameraAlias;               // identity written to .taps header (falls back to ntLocalAlias)
+
+    // Camera calibration persistence (NEW)
+    std::string calibrationFile;           // calibration.json path (empty = <outputDir>/calibration.json)
 };
 
 #endif // TAPS_CAMERANODE_RUNTIME_ARGS_H

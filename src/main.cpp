@@ -17,6 +17,7 @@
 #include "camera/cv_logger.h"
 #include "camera/pps_handler.h"
 #include "camera/fourcc.h"
+#include "camera/apriltag_detector.h"
 #include "runtime_args.h"
 #include "video_queue.h"
 #include "video_recorder.h"
@@ -27,6 +28,7 @@ static VideoBuffer<TimestampedFrame> *g_frameBuffer = nullptr;
 static VideoBuffer<TimestampedFrame> *g_frameBufferStream = nullptr;
 static PPSHandler *g_ppsHandler = nullptr;
 static NTClient *g_ntClient = nullptr;
+static AprilTagDetector *g_apriltag = nullptr;
 
 using namespace cv;
 using namespace std;
@@ -101,6 +103,32 @@ int main(const int argc, char *argv[]) {
     args::ValueFlag ntAliasFlag(parser, "alias", "NetworkTables local alias", {"nt-local"},
                                 flags.ntLocalAlias);
 
+    // NEW: AprilTag detection flags
+    args::Flag apriltagFlag(parser, "apriltag", "Enable AprilTag detection (poses recorded to .taps v0x03 + published over NT)",
+                            {"apriltag"});
+    args::ValueFlag apriltagFamilyFlag(parser, "family", "AprilTag family: tag36h11|tag25h9|tag16h5|tagStandard41h12|tagStandard52h13",
+                                       {"apriltag-family"}, flags.apriltagFamily);
+    args::ValueFlag apriltagThreadsFlag(parser, "threads", "AprilTag detector threads",
+                                        {"apriltag-threads"}, flags.apriltagThreads);
+    args::ValueFlag apriltagQdFlag(parser, "n", "Quad decimation 1-4 (higher = faster, coarser)",
+                                   {"apriltag-quad-decimation"}, flags.apriltagQuadDecimation);
+    args::ValueFlag apriltagBlurFlag(parser, "sigma", "Blur sigma (-1 auto, 0 none)",
+                                     {"apriltag-blur"}, flags.apriltagBlur);
+    args::ValueFlag apriltagPoseFlag(parser, "bool", "Estimate 3D tag poses (needs intrinsics for accuracy)",
+                                     {"apriltag-pose"}, flags.apriltagEstimatePose);
+    args::ValueFlag apriltagSizeFlag(parser, "meters", "Physical tag edge length in meters",
+                                     {"apriltag-tag-size"}, flags.apriltagTagSizeMeters);
+    args::ValueFlag apriltagFxFlag(parser, "px", "Camera focal length fx (px)", {"apriltag-fx"}, flags.apriltagFx);
+    args::ValueFlag apriltagFyFlag(parser, "px", "Camera focal length fy (px)", {"apriltag-fy"}, flags.apriltagFy);
+    args::ValueFlag apriltagCxFlag(parser, "px", "Camera principal point cx (px)", {"apriltag-cx"}, flags.apriltagCx);
+    args::ValueFlag apriltagCyFlag(parser, "px", "Camera principal point cy (px)", {"apriltag-cy"}, flags.apriltagCy);
+    args::ValueFlag cameraAliasFlag(parser, "alias", "Camera identity written into .taps header",
+                                    {"camera-alias"}, flags.cameraAlias);
+    args::ValueFlag calibrationFileFlag(parser, "path",
+                                        "Persisted camera calibration JSON "
+                                        "(default: <output>/calibration.json)",
+                                        {"calibration-file"}, flags.calibrationFile);
+
     args::CompletionFlag completion(parser, {"complete"});
 
     try {
@@ -167,6 +195,23 @@ int main(const int argc, char *argv[]) {
     flags.ntMatchEndTopic = args::get(ntEndFlag);
     flags.ntLocalAlias = args::get(ntAliasFlag);
 
+    // NEW: AprilTag
+    flags.apriltagEnabled = static_cast<bool>(apriltagFlag);
+    flags.apriltagFamily = args::get(apriltagFamilyFlag);
+    flags.apriltagThreads = args::get(apriltagThreadsFlag);
+    flags.apriltagQuadDecimation = args::get(apriltagQdFlag);
+    flags.apriltagBlur = args::get(apriltagBlurFlag);
+    flags.apriltagEstimatePose = args::get(apriltagPoseFlag);
+    flags.apriltagTagSizeMeters = args::get(apriltagSizeFlag);
+    flags.apriltagFx = args::get(apriltagFxFlag);
+    flags.apriltagFy = args::get(apriltagFyFlag);
+    flags.apriltagCx = args::get(apriltagCxFlag);
+    flags.apriltagCy = args::get(apriltagCyFlag);
+    flags.cameraAlias = args::get(cameraAliasFlag);
+    if (flags.cameraAlias.empty())
+        flags.cameraAlias = flags.ntLocalAlias;
+    flags.calibrationFile = args::get(calibrationFileFlag);
+
     if (enumerateOnly) {
         enumerate_camera_modes(flags.cameraId);
         return 0;
@@ -208,6 +253,57 @@ int main(const int argc, char *argv[]) {
         spdlog::info("NetworkTables not configured, running without NT triggers");
     }
 
+    // Initialize AprilTag detector (local target location determination)
+    // Intrinsics precedence: explicit CLI flag > persisted calibration.json
+    // (web calibration wizard, /calibrate) > frame-derived defaults.
+    const fs::path calibrationPath = flags.calibrationFile.empty()
+                                         ? (flags.outputDir / "calibration.json")
+                                         : fs::path(flags.calibrationFile);
+    CalibrationSession::init(calibrationPath, flags.cameraAlias);
+    const SavedCalibration persisted = CalibrationSession::saved();
+    const bool calibSizeMatch = persisted.valid &&
+                                persisted.imageWidth == static_cast<int>(flags.width) &&
+                                persisted.imageHeight == static_cast<int>(flags.height);
+    if (persisted.valid && !calibSizeMatch) {
+        spdlog::warn("Persisted calibration was captured at {}x{} but the camera runs {}x{} - "
+                     "intrinsics NOT applied. Re-run the web calibration (/calibrate) at this resolution.",
+                     persisted.imageWidth, persisted.imageHeight, flags.width, flags.height);
+    }
+
+    AprilTagDetector::Config atCfg;
+    atCfg.enabled = flags.apriltagEnabled;
+    atCfg.family = flags.apriltagFamily;
+    atCfg.threads = flags.apriltagThreads;
+    atCfg.quadDecimation = flags.apriltagQuadDecimation;
+    atCfg.blur = flags.apriltagBlur;
+    atCfg.estimatePose = flags.apriltagEstimatePose;
+    atCfg.tagSizeMeters = flags.apriltagTagSizeMeters;
+    atCfg.fx = static_cast<bool>(apriltagFxFlag) ? flags.apriltagFx
+                                                 : (calibSizeMatch ? persisted.fx : 0.0);
+    atCfg.fy = static_cast<bool>(apriltagFyFlag) ? flags.apriltagFy
+                                                 : (calibSizeMatch ? persisted.fy : 0.0);
+    atCfg.cx = static_cast<bool>(apriltagCxFlag) ? flags.apriltagCx
+                                                 : (calibSizeMatch ? persisted.cx : 0.0);
+    atCfg.cy = static_cast<bool>(apriltagCyFlag) ? flags.apriltagCy
+                                                 : (calibSizeMatch ? persisted.cy : 0.0);
+    if (calibSizeMatch && !static_cast<bool>(apriltagFxFlag)) {
+        spdlog::info("AprilTag intrinsics from persisted calibration (captured {}): "
+                     "fx {:.2f} fy {:.2f} cx {:.2f} cy {:.2f}",
+                     persisted.calibratedAt, atCfg.fx, atCfg.fy, atCfg.cx, atCfg.cy);
+    }
+
+    AprilTagDetector apriltagDetector(atCfg);
+    g_apriltag = &apriltagDetector;
+    if (atCfg.enabled && !apriltagDetector.start()) {
+        spdlog::error("AprilTag detection could not be started; recording without tag metadata");
+    }
+
+    // Apply fresh calibrations from the web wizard immediately (no restart)
+    CalibrationSession::setOnSaved([&apriltagDetector](double fx, double fy, double cx, double cy) {
+        apriltagDetector.updateIntrinsics(fx, fy, cx, cy);
+        spdlog::info("Live AprilTag intrinsics updated by web calibration wizard");
+    });
+
     Mat frame;
     VideoCapture cap;
     cv_cap_setup(&cap, flags);
@@ -226,6 +322,9 @@ int main(const int argc, char *argv[]) {
         spdlog::info("Video recorder configured with PPS timestamps");
     }
 
+    // Wire AprilTag results into the recorder (.taps v0x03 per-frame metadata)
+    VideoRecordThread::setAprilTagDetector(&apriltagDetector);
+
     // Start HTTP server
     HttpServer::begin(&frameBufferStream, flags);
 
@@ -234,7 +333,8 @@ int main(const int argc, char *argv[]) {
         spdlog::warn("SIGINT received");
         g_frameBuffer->shutdown();
         g_frameBufferStream->shutdown();
-        VideoRecordThread::shutdown();
+        VideoRecordThread::shutdown();  // drains encoders (may query apriltag results)
+        if (g_apriltag) g_apriltag->stop();
         HttpServer::stop();
         if (g_ntClient) g_ntClient->stop();
         if (g_ppsHandler) g_ppsHandler->shutdown();
@@ -284,13 +384,20 @@ int main(const int argc, char *argv[]) {
             ptp_ts = std::chrono::high_resolution_clock::now().time_since_epoch();
         }
 
+        // Stable per-captured-frame sequence: ties detections to recorded frames
+        const uint64_t captureSeq = frame_count;
+
+        // Hand frame to AprilTag detector (no-op when disabled)
+        if (atCfg.enabled)
+            apriltagDetector.submit(frame, captureSeq, ptp_ts.count());
+
         if (VideoRecordThread::getState() != VideoRecordThread::RecorderState::Saving) {
-            if (!frameBuffer.tryPush(TimestampedFrame{frame, ptp_ts})) {
+            if (!frameBuffer.tryPush(TimestampedFrame{frame, ptp_ts, captureSeq})) {
                 spdlog::warn("record buffer full, dropping frame #{}", frame_count);
             }
         }
 
-        if (!frameBufferStream.tryPush(TimestampedFrame{frame, ptp_ts})) {
+        if (!frameBufferStream.tryPush(TimestampedFrame{frame, ptp_ts, captureSeq})) {
             spdlog::warn("stream buffer full, dropping frame #{}", frame_count);
         }
 
@@ -309,6 +416,16 @@ int main(const int argc, char *argv[]) {
                         state_str = "saving"; break;
                 }
                 g_ntClient->publish_health(state_str, static_cast<int>(frame_count), rate);
+            }
+
+            // Publish AprilTag poses whenever a new detection batch completed
+            if (atCfg.enabled) {
+                static uint64_t lastTagBatchSeq = 0;
+                const auto batch = apriltagDetector.latestBatch();
+                if (batch.seq > lastTagBatchSeq) {
+                    g_ntClient->publish_tag_poses(batch.tags, batch.ptpNs);
+                    lastTagBatchSeq = batch.seq;
+                }
             }
         }
 
@@ -335,7 +452,8 @@ int main(const int argc, char *argv[]) {
     }
 
     // Cleanup
-    VideoRecordThread::shutdown();
+    VideoRecordThread::shutdown();  // drains encoders (may query apriltag results)
+    if (g_apriltag) g_apriltag->stop();
     HttpServer::stop();
     if (g_ntClient) g_ntClient->stop();
     if (g_ppsHandler) g_ppsHandler->shutdown();

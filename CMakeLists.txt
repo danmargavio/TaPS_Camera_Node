@@ -57,6 +57,29 @@ else()
     set(GPIOD_LIB "")
 endif()
 
+# AprilTag 3 (target detection / pose estimation)
+# Built from source via FetchContent (requires AprilTag >= 3.4 API).
+option(TAPS_ENABLE_APRILTAG "Enable AprilTag detection support" ON)
+if(TAPS_ENABLE_APRILTAG)
+    message(STATUS "AprilTag support enabled")
+    set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(BUILD_PYTHON_WRAPPER OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+            apriltag
+            GIT_REPOSITORY https://github.com/AprilRobotics/apriltag.git
+            GIT_TAG 3.4.3
+            GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(apriltag)
+    find_package(Threads REQUIRED)
+    add_definitions(-DHAVE_APRILTAG)
+    set(APRILTAG_LIB apriltag Threads::Threads)
+else()
+    message(STATUS "AprilTag support disabled")
+    set(APRILTAG_LIB "")
+endif()
+
 find_package(OpenCV 5.0 REQUIRED)
 find_package(spdlog REQUIRED)
 find_package(LibHttpServer REQUIRED)
@@ -72,6 +95,8 @@ add_executable(
         src/camera/cv_cap.h
         src/camera/pps_handler.cpp
         src/camera/pps_handler.h
+        src/camera/apriltag_detector.cpp
+        src/camera/apriltag_detector.h
         src/runtime_args.h
         src/video_queue.h
         src/video_recorder.h
@@ -80,6 +105,8 @@ add_executable(
         src/playback/playback_manager.cpp
         src/playback/playback_manager.h
         src/webserver/http_server.h
+        src/webserver/calibration.cpp
+        src/webserver/calibration.h
         src/webserver/nt_client.cpp
         src/webserver/nt_client.h
 )
@@ -92,6 +119,7 @@ target_link_libraries(TaPS_CameraNode PRIVATE
         nlohmann_json::nlohmann_json
         ${NT_LIB}
         ${GPIOD_LIB}
+        ${APRILTAG_LIB}
 )
 
 target_include_directories(TaPS_CameraNode PRIVATE
@@ -101,3 +129,6 @@ target_include_directories(TaPS_CameraNode PRIVATE
 
 # Install
 install(TARGETS TaPS_CameraNode DESTINATION bin)
+# Web UI templates (served relative to the process working directory —
+# set systemd WorkingDirectory to ${CMAKE_INSTALL_PREFIX}/share/taps_camera_node)
+install(DIRECTORY templates/ DESTINATION share/taps_camera_node/templates)

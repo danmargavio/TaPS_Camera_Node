@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TaPS | Camera Calibration</title>
+<style>
+    :root {
+        --bg-color: #0f172a;
+        --card-bg: #1e293b;
+        --border-color: #334155;
+        --text-main: #f8fafc;
+        --text-muted: #94a3b8;
+        --primary: #3b82f6;
+        --success: #22c55e;
+        --danger: #ef4444;
+        --warning: #f59e0b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    body { background: var(--bg-color); color: var(--text-main); min-height: 100vh; padding: 1.5rem;
+           display: flex; justify-content: center; }
+    .container { width: 100%; max-width: 1200px; }
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; gap: .5rem; }
+    .header h1 { font-size: 1.25rem; font-weight: 600; }
+    .header a { color: var(--text-muted); text-decoration: none; font-size: .9rem; }
+    .header a:hover { color: var(--text-main); }
+
+    .badge { display: inline-flex; align-items: center; gap: .4rem; padding: .3rem .7rem; border-radius: 9999px;
+             font-size: .8rem; font-weight: 600; border: 1px solid var(--border-color); background: rgba(148,163,184,.08);
+             color: var(--text-muted); }
+    .badge.ok { color: var(--success); border-color: rgba(34,197,94,.3); background: rgba(34,197,94,.1); }
+    .badge.miss { color: var(--danger); border-color: rgba(239,68,68,.3); background: rgba(239,68,68,.1); }
+
+    /* step bar */
+    .steps { display: flex; gap: .4rem; margin-bottom: 1rem; flex-wrap: wrap; }
+    .step { flex: 1; min-width: 140px; padding: .5rem .75rem; border-radius: 8px; border: 1px solid var(--border-color);
+            background: var(--card-bg); color: var(--text-muted); font-size: .85rem; display: flex; align-items: center; gap: .5rem; }
+    .step.active { border-color: var(--primary); color: var(--text-main); }
+    .step.done { color: var(--success); }
+    .stepnum { width: 22px; height: 22px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
+               background: var(--border-color); font-size: .75rem; font-weight: 700; color: var(--text-main); flex: none; }
+    .step.active .stepnum { background: var(--primary); }
+    .step.done .stepnum { background: var(--success); color: #06210f; }
+
+    .grid { display: grid; grid-template-columns: minmax(0,2fr) minmax(280px,1fr); gap: 1rem; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+    .card { background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 12px; padding: 1.25rem; }
+    .card h2 { font-size: 1rem; margin-bottom: .75rem; }
+    .card p, .card li { color: var(--text-muted); font-size: .875rem; line-height: 1.5; }
+    .card ul { margin: .5rem 0 .75rem 1.2rem; }
+    .hidden { display: none !important; }
+
+    .video-wrap { background: #000; border: 1px solid var(--border-color); border-radius: 12px; overflow: hidden;
+                  aspect-ratio: 16/9; display: flex; align-items: center; justify-content: center; }
+    .video-wrap img { width: 100%; height: 100%; object-fit: contain; }
+    .waiting { color: var(--text-muted); font-size: .9rem; }
+
+    button { background: var(--primary); border: none; color: #fff; padding: .6rem 1.1rem; border-radius: 8px;
+             font-size: .9rem; font-weight: 600; cursor: pointer; }
+    button:hover { filter: brightness(1.15); }
+    button:disabled { opacity: .4; cursor: not-allowed; }
+    button.secondary { background: transparent; border: 1px solid var(--border-color); color: var(--text-main); }
+    button.danger { background: transparent; border: 1px solid rgba(239,68,68,.4); color: var(--danger); }
+    .btnrow { display: flex; gap: .6rem; flex-wrap: wrap; margin-top: 1rem; }
+
+    label { display: block; font-size: .8rem; color: var(--text-muted); margin: .7rem 0 .25rem; }
+    select, input[type="number"] { width: 100%; background: #0f172a; color: var(--text-main);
+        border: 1px solid var(--border-color); border-radius: 6px; padding: .45rem .5rem; font-size: .9rem; }
+    .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; }
+
+    code { background: #0f172a; border: 1px solid var(--border-color); border-radius: 4px; padding: .05rem .35rem;
+           font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .8rem; }
+    .kv { display: grid; grid-template-columns: auto 1fr; gap: .25rem .8rem; font-size: .85rem; margin-top: .5rem; }
+    .kv dt { color: var(--text-muted); } .kv dd { font-family: ui-monospace, Menlo, Consolas, monospace; }
+
+    /* focus stage */
+    .score-big { font-size: 2.6rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .score-lbl { font-size: .75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: .06em; }
+    .bar { height: 14px; background: #0f172a; border: 1px solid var(--border-color); border-radius: 7px; overflow: hidden; margin: .4rem 0; }
+    .bar > div { height: 100%; background: var(--warning); width: 0%; transition: width .15s linear; }
+    .bar > div.pass { background: var(--success); }
+    .pill { display: inline-block; padding: .25rem .7rem; border-radius: 9999px; font-size: .8rem; font-weight: 700; }
+    .pill.pass { background: rgba(34,197,94,.15); color: var(--success); border: 1px solid rgba(34,197,94,.4); }
+    .pill.fail { background: rgba(245,158,11,.15); color: var(--warning); border: 1px solid rgba(245,158,11,.4); }
+
+    /* collect coverage */
+    .fov { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: .5rem 0; }
+    .cell { aspect-ratio: 4/3; border: 1px solid var(--border-color); border-radius: 6px; background: #0f172a;
+            display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; }
+    .cell .n { font-weight: 700; font-size: 1rem; }
+    .cell .lbl { font-size: .6rem; color: var(--text-muted); text-transform: uppercase; }
+    .cell.part .n { color: var(--warning); }
+    .cell.full { border-color: rgba(34,197,94,.5); } .cell.full .n { color: var(--success); }
+    .chips { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .4rem; }
+    .chip { padding: .25rem .6rem; border-radius: 9999px; border: 1px solid var(--border-color);
+            font-size: .75rem; color: var(--text-muted); }
+    .chip.full { color: var(--success); border-color: rgba(34,197,94,.5); }
+    .chip.part { color: var(--warning); border-color: rgba(245,158,11,.4); }
+    .msg { margin-top: .6rem; font-size: .85rem; min-height: 1.2em; color: var(--text-muted); }
+</style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>Camera Calibration</h1>
+        <div style="display:flex; gap:.75rem; align-items:center;">
+            <span id="calibBadge" class="badge">checking…</span>
+            <a href="/" id="homeLink">← Main page</a>
+        </div>
+    </div>
+
+    <div class="steps">
+        <div class="step" id="step1"><span class="stepnum">1</span>Target</div>
+        <div class="step" id="step2"><span class="stepnum">2</span>Focus</div>
+        <div class="step" id="step3"><span class="stepnum">3</span>Capture</div>
+        <div class="step" id="step4"><span class="stepnum">4</span>Result</div>
+    </div>
+
+    <div class="grid">
+        <div>
+            <div class="video-wrap" id="videoWrap">
+                <img id="streamImg" src="" alt="camera" class="hidden">
+                <div class="waiting" id="streamWait">Camera preview starts here after you begin calibration.</div>
+            </div>
+            <div class="msg" id="msgBar"></div>
+        </div>
+
+        <div>
+            <!-- STEP 1: target setup -->
+            <div class="card" id="panelConfig">
+                <h2>Checkerboard target</h2>
+                <p>Recommended: print a <strong>10&nbsp;&times;&nbsp;7 square</strong> board
+                   (9&nbsp;&times;&nbsp;6 inner corners), squares about <strong>25&nbsp;mm</strong>,
+                   on flat matte paper. Count <em>inner corners</em>, not squares.</p>
+                <div class="row2">
+                    <div>
+                        <label for="patW">Inner corners — width</label>
+                        <select id="patW"></select>
+                    </div>
+                    <div>
+                        <label for="patH">Inner corners — height</label>
+                        <select id="patH"></select>
+                    </div>
+                </div>
+                <label for="sqSize">Square size (measure your print!)</label>
+                <div class="row2">
+                    <select id="sqSize">
+                        <option value="25" selected>25 mm</option>
+                        <option value="10">10 mm</option>
+                        <option value="15">15 mm</option>
+                        <option value="20">20 mm</option>
+                        <option value="28">28 mm</option>
+                        <option value="30">30 mm</option>
+                        <option value="custom">Custom…</option>
+                    </select>
+                    <input type="number" id="sqCustom" min="3" max="250" step="0.1"
+                           placeholder="mm" class="hidden">
+                </div>
+                <div class="btnrow">
+                    <button id="btnStart">Start calibration</button>
+                    <button class="secondary" onclick="printBoard()">Print board</button>
+                </div>
+                <div id="savedInfo"></div>
+            </div>
+
+            <!-- STEP 2: focus -->
+            <div class="card hidden" id="panelFocus">
+                <h2>Focus test</h2>
+                <p>Place the checkerboard <strong>at least 1&nbsp;foot (30&nbsp;cm) away</strong>, fill
+                   the frame, and <strong>hold it completely still</strong> (a stand helps). Turn the
+                   lens focus ring until the sharpness score <em>maximizes</em>, then lock the ring.</p>
+                <div style="margin-top:.8rem;">
+                    <div class="score-lbl">Spatial-frequency sharpness</div>
+                    <div class="score-big" id="focusCur">–</div>
+                    <div class="bar"><div id="focusBar"></div></div>
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <span style="font-size:.8rem; color:var(--text-muted);">
+                            Session best: <span id="focusBest">–</span></span>
+                        <span class="pill fail" id="focusPill">adjusting</span>
+                    </div>
+                </div>
+                <div class="btnrow">
+                    <button id="btnFocusNext">Next: capture images →</button>
+                    <button class="danger" id="btnAbort1">✕ Abort &amp; return to main</button>
+                </div>
+            </div>
+
+            <!-- STEP 3: collect -->
+            <div class="card hidden" id="panelCollect">
+                <h2>Capture coverage</h2>
+                <p>Present the board at <strong>every region of the view</strong> — hold it steady at
+                   each spot until you see <span style="color:var(--success)">CAPTURED</span>. Include
+                   tilts: tip the board toward each edge. A frame is only stored when the pattern is
+                   detected and adds new information.</p>
+                <div class="fov" id="fovGrid"></div>
+                <div class="score-lbl">Orientation variety</div>
+                <div class="chips" id="tiltChips"></div>
+                <div style="margin-top:.7rem;">
+                    <div style="display:flex; justify-content:space-between; font-size:.8rem;">
+                        <span style="color:var(--text-muted)">Frames</span>
+                        <span id="collectTotal">0</span>
+                    </div>
+                    <div class="bar"><div id="collectBar"></div></div>
+                </div>
+                <div class="btnrow">
+                    <button id="btnFinish" disabled>Finish early</button>
+                    <button class="danger" id="btnAbort2">✕ Abort &amp; return to main</button>
+                </div>
+            </div>
+
+            <!-- STEP 3b: processing -->
+            <div class="card hidden" id="panelProcessing">
+                <h2>Computing calibration…</h2>
+                <p>Running bundle adjustment over the collected views. Keep the page open — this takes a
+                   few seconds. Results are saved automatically with the current date and the temporary
+                   images are deleted.</p>
+                <div class="btnrow">
+                    <button class="danger" id="btnAbort3">✕ Abort &amp; return to main</button>
+                </div>
+            </div>
+
+            <!-- STEP 4: result -->
+            <div class="card hidden" id="panelDone">
+                <h2 id="doneTitle">✓ Calibration complete</h2>
+                <div class="kv" id="resultKv"></div>
+                <p id="doneWarn" class="hidden" style="color:var(--warning); margin-top:.6rem;"></p>
+                <div class="btnrow">
+                    <button id="btnReturn" class="secondary">Return to main page</button>
+                    <button id="btnRepeat">Repeat calibration</button>
+                </div>
+            </div>
+
+            <!-- failed -->
+            <div class="card hidden" id="panelFailed">
+                <h2 style="color:var(--danger)">✗ Calibration failed</h2>
+                <p id="failMsg"></p>
+                <div class="btnrow">
+                    <button id="btnBackToStart">Back to start</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const TILT_LABELS = ['Front', 'Left', 'Right', 'Up', 'Down'];
+const CELL_LABELS = ['TL','TM','TR','ML','MM','MR','BL','BM','BR'];
+let stage = 'idle';
+let streaming = false;
+
+// populate inner-corner selects 4..20
+for (let n = 4; n <= 20; n++) {
+    $('patW').add(new Option(n + ' corners', n, false, n === 9));
+    $('patH').add(new Option(n + ' corners', n, false, n === 6));
+}
+
+// build FOV grid + tilt chips once
+const fov = $('fovGrid');
+for (let i = 0; i < 9; i++) {
+    const d = document.createElement('div');
+    d.className = 'cell'; d.id = 'cell' + i;
+    d.innerHTML = `<div class="n">0/5</div><div class="lbl">${CELL_LABELS[i]}</div>`;
+    fov.appendChild(d);
+}
+const chips = $('tiltChips');
+for (let i = 0; i < 5; i++) {
+    const s = document.createElement('span');
+    s.className = 'chip'; s.id = 'tilt' + i; s.textContent = TILT_LABELS[i];
+    chips.appendChild(s);
+}
+
+$('sqSize').addEventListener('change', () => {
+    $('sqCustom').classList.toggle('hidden', $('sqSize').value !== 'custom');
+});
+
+function squareMm() {
+    return $('sqSize').value === 'custom'
+        ? (parseFloat($('sqCustom').value) || 25.0)
+        : parseFloat($('sqSize').value);
+}
+
+async function post(body) {
+    const r = await fetch('/calib/control', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+    });
+    return r.json();
+}
+
+$('btnStart').addEventListener('click', async () => {
+    const r = await post({action: 'start',
+        pattern_w: parseInt($('patW').value),
+        pattern_h: parseInt($('patH').value),
+        square_mm: squareMm()});
+    if (r.error) alert(r.error);
+    poll();
+});
+// Abort = cancel the device session AND leave the wizard (per user flow).
+const sessionRunning = () => ['focus', 'collect', 'processing'].includes(stage);
+const beaconAbort = () => navigator.sendBeacon('/calib/control',
+    new Blob([JSON.stringify({action: 'abort'})], {type: 'application/json'}));
+function exitToMain() {
+    beaconAbort();      // fire-and-forget: survives this page unloading, and a
+    location.href = '/'; // long abort (mid-compute) won't stall the navigation
+}
+
+$('btnFocusNext').addEventListener('click', async () => { await post({action: 'next'}); poll(); });
+$('btnFinish').addEventListener('click', async () => {
+    const r = await post({action: 'finish'});
+    if (r.error) alert(r.error);
+    poll();
+});
+$('btnAbort1').addEventListener('click', exitToMain);
+$('btnAbort2').addEventListener('click', exitToMain);
+$('btnAbort3').addEventListener('click', exitToMain);
+
+// Leaving via the header link mid-session must not strand a running session.
+$('homeLink').addEventListener('click', (e) => {
+    if (sessionRunning()) {
+        if (!confirm('Calibration is in progress. Abort it and return to the main page?')) {
+            e.preventDefault();
+            return;
+        }
+        beaconAbort();   // fires even while this page unloads
+    }
+});
+// Closing/reloading the tab mid-session aborts the device-side session too.
+window.addEventListener('pagehide', () => { if (sessionRunning()) beaconAbort(); });
+$('btnReturn').addEventListener('click', async () => { await post({action: 'reset'}); location.href = '/'; });
+$('btnRepeat').addEventListener('click', async () => { await post({action: 'reset'}); poll(); });
+$('btnBackToStart').addEventListener('click', async () => { await post({action: 'reset'}); poll(); });
+
+function setStream(on) {
+    if (on === streaming) return;
+    streaming = on;
+    if (on) { $('streamImg').src = '/calib/stream?t=' + Date.now(); }
+    else { $('streamImg').src = ''; }
+    $('streamImg').classList.toggle('hidden', !on);
+    $('streamWait').classList.toggle('hidden', on);
+}
+
+function showPanel(id) {
+    for (const p of ['panelConfig','panelFocus','panelCollect','panelProcessing','panelDone','panelFailed'])
+        $(p).classList.toggle('hidden', p !== id);
+    const stepIdx = {panelConfig:1, panelFocus:2, panelCollect:3, panelProcessing:3,
+                     panelDone:4, panelFailed:4}[id];
+    for (let i = 1; i <= 4; i++) {
+        const el = $('step' + i);
+        el.classList.toggle('active', i === stepIdx);
+        el.classList.toggle('done', i < stepIdx);
+    }
+}
+
+function fmt(x, d = 2) { return (x === null || x === undefined) ? '–' : Number(x).toFixed(d); }
+
+function render(s) {
+    // calibration badge (always)
+    const c = s.calibration;
+    const badge = $('calibBadge');
+    if (c) {
+        badge.className = 'badge ok';
+        badge.textContent = 'Intrinsics: ' + c.calibrated_at + ' · err ' + fmt(c.reprojection_error_px, 3) + ' px';
+    } else {
+        badge.className = 'badge miss';
+        badge.textContent = 'Intrinsics: none';
+    }
+
+    stage = s.stage;
+    switch (s.stage) {
+        case 'idle':
+            showPanel('panelConfig');
+            setStream(false);
+            $('savedInfo').innerHTML = c
+                ? `<div class="kv">
+                     <dt>Last calibrated</dt><dd>${c.calibrated_at}</dd>
+                     <dt>fx / fy</dt><dd>${fmt(c.fx)} / ${fmt(c.fy)}</dd>
+                     <dt>cx / cy</dt><dd>${fmt(c.cx)} / ${fmt(c.cy)}</dd>
+                     <dt>Reproj. error</dt><dd>${fmt(c.reprojection_error_px, 3)} px</dd>
+                     <dt>Resolution</dt><dd>${c.image_width}×${c.image_height}</dd>
+                   </div><p style="margin-top:.5rem;">File: <code>${s.calibration_file}</code></p>`
+                : `<p style="margin-top:.5rem;">No intrinsics stored yet. File: <code>${s.calibration_file}</code></p>`;
+            break;
+
+        case 'focus': {
+            showPanel('panelFocus');
+            setStream(true);
+            const f = s.focus || {};
+            $('focusCur').textContent = f.board ? fmt(f.current, 0) : 'no board';
+            $('focusBest').textContent = fmt(f.best, 0);
+            const pct = f.best > 0 ? Math.min(100, f.current / f.best * 100) : 0;
+            const bar = $('focusBar');
+            bar.style.width = pct + '%';
+            bar.className = f.pass ? 'pass' : '';
+            const pill = $('focusPill');
+            pill.className = 'pill ' + (f.pass ? 'pass' : 'fail');
+            pill.textContent = f.pass ? 'PASS — lock focus' : 'adjust focus';
+            break;
+        }
+
+        case 'collect': {
+            showPanel('panelCollect');
+            setStream(true);
+            const col = s.collect || {};
+            const cells = col.cells || [0,0,0,0,0,0,0,0,0];
+            for (let i = 0; i < 9; i++) {
+                const el = $('cell' + i);
+                el.querySelector('.n').textContent = cells[i] + '/' + col.cell_goal;
+                el.className = 'cell ' + (cells[i] >= col.cell_goal ? 'full' : (cells[i] > 0 ? 'part' : ''));
+            }
+            const tilts = col.tilts || [0,0,0,0,0];
+            for (let i = 0; i < 5; i++) {
+                const el = $('tilt' + i);
+                el.textContent = `${TILT_LABELS[i]} ${tilts[i]}/${col.tilt_goal}`;
+                el.className = 'chip ' + (tilts[i] >= col.tilt_goal ? 'full' : (tilts[i] > 0 ? 'part' : ''));
+            }
+            $('collectTotal').textContent = col.total + ' collected · auto-completes when coverage is full';
+            $('collectBar').style.width = Math.min(100, col.total / 45 * 100) + '%';
+            $('btnFinish').disabled = !col.early_ok;
+            break;
+        }
+
+        case 'processing':
+            showPanel('panelProcessing');
+            setStream(false);
+            break;
+
+        case 'done': {
+            showPanel('panelDone');
+            setStream(false);
+            const r = s.result || c || {};
+            $('resultKv').innerHTML = `
+                <dt>Saved</dt><dd>${(r.calibrated_at || '').replace('T', ' ')} UTC</dd>
+                <dt>File</dt><dd>${s.calibration_file}</dd>
+                <dt>fx</dt><dd>${fmt(r.fx, 4)}</dd>
+                <dt>fy</dt><dd>${fmt(r.fy, 4)}</dd>
+                <dt>cx</dt><dd>${fmt(r.cx, 2)} px</dd>
+                <dt>cy</dt><dd>${fmt(r.cy, 2)} px</dd>
+                <dt>Distortion</dt><dd>${(r.distortion || []).map(d => Number(d).toExponential(3)).join(', ')}</dd>
+                <dt>Reprojection error</dt><dd>${fmt(r.reprojection_error_px, 3)} px</dd>
+                <dt>Frames used</dt><dd>${r.frames_used ?? '–'}</dd>
+                <dt>Board</dt><dd>${r.pattern_width ?? '–'}×${r.pattern_height ?? '–'} inner @ ${fmt(r.square_mm,1)} mm</dd>`;
+            const warn = $('doneWarn');
+            if (r.warning) { warn.textContent = r.warning; warn.classList.remove('hidden'); }
+            else warn.classList.add('hidden');
+            break;
+        }
+
+        case 'failed':
+            showPanel('panelFailed');
+            setStream(false);
+            $('failMsg').textContent = s.error || 'Unknown error';
+            break;
+    }
+
+    $('msgBar').textContent = s.last_message && s.stage === 'collect' ? s.last_message : '';
+}
+
+async function poll() {
+    try {
+        const r = await fetch('/calib/status');
+        render(await r.json());
+    } catch (e) { /* node offline */ }
+}
+poll();
+setInterval(poll, 300);
+
+
+// Printable checkerboard: draws (pattern+1) squares; user verifies scale with the 50 mm ruler,
+// then enters the MEASURED square size above.
+function printBoard() {
+    const w = parseInt($('patW').value) + 1;   // squares = inner corners + 1
+    const h = parseInt($('patH').value) + 1;
+    const mm = squareMm();
+    const px = Math.round(mm * 96 / 25.4);     // 96 dpi nominal
+    const c = document.createElement('canvas');
+    c.width = w * px; c.height = h * px;
+    const g = c.getContext('2d');
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        g.fillStyle = (x + y) % 2 ? '#000' : '#fff';
+        g.fillRect(x * px, y * px, px, px);
+    }
+    // 50 mm calibration ruler below the board
+    const rulerH = 40, rulerW = Math.round(50 * 96 / 25.4);
+    c.height = h * px + rulerH;
+    g.fillStyle = '#fff'; g.fillRect(0, h * px, Math.max(c.width, rulerW + 20), rulerH);
+    g.fillStyle = '#000';
+    g.fillRect(5, h * px + 10, rulerW, 10);
+    g.font = '12px sans-serif';
+    g.fillText('verify: black bar = 50 mm at 100% print scale', 5, h * px + 34);
+
+    const win = window.open('', '_blank');
+    win.document.write(`<!DOCTYPE html><html><head><title>Checkerboard</title>
+        <style>body{margin:10mm}img{max-width:100%}@page{margin:5mm}</style></head>
+        <body onload="window.print()">
+        <p>Print at <b>100% scale</b> (no "fit to page"), then <b>measure a printed square</b> and
+           enter that value as the custom square size.</p>
+        <img src="${c.toDataURL()}"></body></html>`);
+    win.document.close();
+}
+</script>
+</body>
+</html>

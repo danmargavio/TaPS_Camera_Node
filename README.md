@@ -137,11 +137,16 @@ python main.py server_node.yaml
 
 ## .taps File Format
 
-The `.taps` binary format stores video frames with PTP timestamps:
+Full specification: [`../common/taps_format.md`](../common/taps_format.md)
+
+The `.taps` binary format stores video frames with GPS-aligned nanosecond
+timestamps (PPS + chrony discipline; PTP optional). Version `0x02` is the
+baseline; version `0x03` adds per-frame AprilTag detections (id, pose, and
+quality/uncertainty metrics for fusion) plus camera intrinsics in the header.
 
 ```
 Header:
-  Magic:     'TaPS\x02' (5 bytes)
+  Magic:     'TaPS\x02' or 'TaPS\x03' (5 bytes)
   Encoder:   uint8 (0=JPEG, 1=RAW)
   Width:     uint64
   Height:    uint64
@@ -149,13 +154,107 @@ Header:
   ArgsLen:   uint32
   Args:      string (variable length)
   FrameCount:uint64
+  [0x03 only] Fx,Fy,Cx,Cy: 4×double (intrinsics) · TagSizeM: double
+            · CameraAlias: u32+string · TagFamily: u32+string
 
 Frame (repeated):
   FrameIdx:  uint64
-  PTP_Ns:    int64
+  PTP_Ns:    int64        (GPS-aligned nanoseconds; see spec)
   Size:      uint32
+  [0x03 only] MetaSize:   uint32
   Data:      bytes (variable length)
+  [0x03 only] Meta:       bytes (AprilTag records; see spec)
 ```
+
+## AprilTag Detection (CameraNode)
+
+Each CameraNode can perform local AprilTag detection with 3D pose estimation
+(AprilTag 3 + OpenCV solvePnP). Detections are stamped with the frame's
+GPS-aligned timestamp and travel two paths:
+
+1. **Live**: published on NetworkTables table `AprilTag` — `tag_{id}_pose_translation`
+   (3 doubles, meters), `tag_{id}_pose_rotation` (9 doubles, row-major), `tag_ids`,
+   `tags_visible`, `ptp_ns`, `camera` (alias). Matches the robot_tracker topic layout.
+2. **Recorded**: .taps v0x03 per-frame metadata (id, pose, decision margin, hamming,
+   reprojection RMS, apparent tag size — see `common/taps_format.md`). The ServerNode
+   fuses these across cameras for higher-confidence robot localization.
+
+Enabling and tuning:
+
+```bash
+camera_node ... \
+    --apriltag \
+    --apriltag-family tag36h11 \
+    --apriltag-tag-size 0.165 \
+    --apriltag-fx 610 --apriltag-fy 610 --apriltag-cx 640 --apriltag-cy 360 \
+    --apriltag-quad-decimation 2 \
+    --apriltag-threads 1 \
+    --camera-alias CameraNode1
+```
+
+Notes:
+- Intrinsics load automatically from `calibration.json` (see **Camera Calibration
+  Wizard** below); `--apriltag-fx/fy/cx/cy` explicitly passed on the CLI override it.
+  With neither, poses use a documented default (f = frame size, c = center).
+- `--apriltag-pose false` records detection-only metadata (no 3D pose).
+- Detection runs on a background thread with latest-frame handoff; if it falls
+  behind capture, frames are skipped for detection but video is never slowed.
+- Build: CMake fetches AprilTag 3.4.3 automatically (`-DTAPS_ENABLE_APRILTAG=OFF`
+  builds without it; the binary then warns if `--apriltag` is requested).
+
+## Camera Calibration Wizard (one-time, headless)
+
+Open `http://<camera-node>:8080/calibrate` — a guided four-step wizard that
+replaces the old desktop `camera_calibration.py` helper and works entirely in
+the browser against the live camera:
+
+1. **Target** — shows whether intrinsics are already stored and when they were
+   captured. Choose the checkerboard inner-corner count (pulldowns, default
+   9×6 = a printed 10×7-square board) and the square size in mm (pulldowns +
+   custom). A "Print board" button generates a scale-checked printable board.
+   **Start calibration** begins even if intrinsics already exist (recalibrate).
+2. **Focus test** — live view with a real-time *spatial-frequency sharpness
+   score* (variance of the Laplacian measured on the digitally rectified
+   checkerboard, so it is invariant to distance/position). Shows the current
+   score, the session best, and a PASS indicator (≥60 % of the session best).
+   Instructions: place the board ≥1 ft away, hold still, turn the focus ring to
+   maximize the score, then lock it. **Next** proceeds.
+3. **Capture coverage** — presents the live view with a green checkerboard
+   overlay and a 3×3 FOV grid. Frames are stored only when the pattern is
+   detected, the board is held still, and the view is *new* (≥40 px corner
+   displacement from any stored frame). Coverage is enforced by nine FOV
+   regions (`n/5` each — e.g. "lower-left 3/5") **and** orientation variety
+   (front / left / right / up / down tilts, `n/4` each) — shown as fill meters
+   on the page and drawn on the video itself. Auto-advances when full; a
+   **Finish early** button unlocks after 24 well-distributed frames.
+4. **Result** — runs `cv::calibrateCamera`, shows reprojection error, fx/fy/
+   cx/cy, distortion coefficients and frames used, **writes `calibration.json`
+   atomically** (timestamped, overwrites the previous calibration), deletes the
+   temporary images, and live-updates the running AprilTag detector — no
+   restart needed. *Return to main page* / *Repeat calibration* buttons.
+
+An **"✕ Abort & return to main"** button is available in every active step
+(focus, capture, and computing): it cancels the device-side session, deletes
+the temporary images, and returns to the status page. Leaving the wizard via
+the header link asks for confirmation and aborts as well — closing or
+reloading the tab mid-session also aborts (beacon on page hide), so a session
+can never be left running unattended.
+
+Storage & precedence:
+
+- Default file: `<--output>/calibration.json` (override with `--calibration-file`).
+- Loaded at startup; applied only when `image_width/height` matches the current
+  capture resolution (changing resolution invalidates it — recalibrate).
+- Precedence: explicit CLI `--apriltag-fx/fy/cx/cy` > calibration.json >
+  frame-derived defaults.
+- The wizard works whether or not `--apriltag` is enabled (the intrinsics are
+  still stored for later). Recording must be stopped before starting a session.
+- `/` (status page) shows a calibration badge: present + captured date +
+  reprojection error, or "missing".
+
+Endpoints: `GET /calibrate` (wizard page), `GET /calib/status` (state/focus/
+coverage JSON, polled by the page), `POST /calib/control`
+(`start|next|finish|abort|reset`), `GET /calib/stream` (overlay MJPEG).
 
 ## Web Frontend
 
@@ -235,6 +334,10 @@ web:
 | `/recording` | POST | Start/stop recording (`{"action": "start/stop"}`) |
 | `/events` | GET | SSE events (status, disk, cpu, mem) |
 | `/files/` | GET | Browse recorded files |
+| `/calibrate` | GET | Guided calibration wizard page |
+| `/calib/status` | GET | Calibration state / focus score / coverage JSON |
+| `/calib/control` | POST | `{"action":"start|next|finish|abort|reset", ...}` |
+| `/calib/stream` | GET | MJPEG calibration view with overlays |
 
 ### ServerNode Endpoints
 

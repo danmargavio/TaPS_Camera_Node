@@ -6,6 +6,7 @@
 #define TAPS_CAMERANODE_VIDEO_RECORDER_H
 
 #include <chrono>
+#include <bit>
 #include <functional>
 #include <thread>
 #include <vector>
@@ -25,6 +26,7 @@
 #include <spdlog/spdlog.h>
 #include "runtime_args.h"
 #include "video_queue.h"
+#include "camera/apriltag_detector.h"
 
 // Forward declaration
 class PPSHandler;
@@ -34,6 +36,7 @@ namespace fs = std::filesystem;
 struct TimestampedFrame {
     cv::Mat frame;
     std::chrono::nanoseconds ptpTimestamp;
+    uint64_t seq{0}; // stable capture sequence (ties AprilTag detections to frames)
 };
 
 class VideoRecordThread {
@@ -56,6 +59,18 @@ public:
         s_encoderArgs = flags.encoderArgs;
         s_numEncoders = flags.encoderThreads;
 
+        // AprilTag header extras for .taps v0x03 (see common/taps_format.md)
+        s_atCfg = {};
+        s_atCfg.enabled = flags.apriltagEnabled;
+        s_atCfg.family = flags.apriltagFamily;
+        s_atCfg.estimatePose = flags.apriltagEstimatePose;
+        s_atCfg.tagSizeMeters = flags.apriltagTagSizeMeters;
+        s_atCfg.fx = flags.apriltagFx;
+        s_atCfg.fy = flags.apriltagFy;
+        s_atCfg.cx = flags.apriltagCx;
+        s_atCfg.cy = flags.apriltagCy;
+        s_cameraAlias = flags.cameraAlias;
+
         state = RecorderState::Idle;
         s_dispatcherThread = std::thread(dispatcher);
     }
@@ -63,6 +78,11 @@ public:
     // NEW: Set PPS handler for hardware timestamps
     static void setPPSHandler(PPSHandler *handler) {
         s_ppsHandler = handler;
+    }
+
+    // NEW: AprilTag detector source for per-frame .taps metadata
+    static void setAprilTagDetector(AprilTagDetector *detector) {
+        s_apriltag = detector;
     }
 
     static void setRecording(const bool record) {
@@ -105,6 +125,7 @@ private:
     struct Job {
         uint64_t frameIdx{};
         int64_t ptpNs{};
+        uint64_t captureSeq{}; // stable capture sequence for tag metadata lookup
         cv::Mat frame;
     };
 
@@ -112,6 +133,7 @@ private:
         uint64_t frameIdx{};
         int64_t ptpNs{};
         std::vector<unsigned char> jpegData; // holds either JPEG or raw bytes
+        std::vector<unsigned char> meta;     // .taps v0x03 AprilTag metadata (empty if none)
     };
 
     class WorkerInbox {
@@ -206,7 +228,45 @@ private:
         unsigned nextWorker = 0;
         unsigned numEncoders = 0;
         EncoderType encoderType{};
+        bool useV3 = false; // .taps v0x03 (AprilTag extras active for this session)
     };
+
+    // --- .taps v0x03 metadata serialization (see common/taps_format.md) ---
+    static_assert(std::endian::native == std::endian::little,
+                  ".taps format is little-endian; big-endian hosts need explicit byte swapping");
+
+    static void appendU8(std::vector<unsigned char> &out, const uint8_t v) {
+        out.push_back(v);
+    }
+
+    template<typename T>
+    static void appendLE(std::vector<unsigned char> &out, const T &v) {
+        const auto *p = reinterpret_cast<const unsigned char *>(&v);
+        out.insert(out.end(), p, p + sizeof(T));
+    }
+
+    // Serializes one 64-byte TagRecord per spec.
+    static void appendTagRecord(std::vector<unsigned char> &out, const TagDetectionResult &t) {
+        appendLE<uint16_t>(out, t.tagId);
+        appendLE<float>(out, t.decisionMargin);
+        appendU8(out, t.hamming);
+        appendU8(out, t.poseValid ? 1 : 0);
+        for (const double v: t.translation) appendLE<float>(out, static_cast<float>(v));
+        for (const double v: t.rotation) appendLE<float>(out, static_cast<float>(v));
+        appendLE<float>(out, t.reprojErrorRmsPx);
+        appendLE<float>(out, t.tagPxDiag);
+    }
+
+    static std::vector<unsigned char> packTagMeta(const TagBatch &batch) {
+        std::vector<unsigned char> out;
+        const size_t n = std::min<size_t>(batch.tags.size(), AprilTagDetector::kMaxTagsPerFrame);
+        if (n == 0) return out;
+        out.reserve(1 + n * 64);
+        appendU8(out, static_cast<uint8_t>(n));
+        for (size_t i = 0; i < n; ++i)
+            appendTagRecord(out, batch.tags[i]);
+        return out;
+    }
 
     static std::map<std::string, std::string> parseEncoderArgs(const std::string &argsStr) {
         std::map<std::string, std::string> argsMap;
@@ -276,9 +336,11 @@ private:
         }
         spdlog::info("Recording to {}", session->outputFile.c_str());
 
-        // Write header
+        // Write header (v0x03 when AprilTag metadata is active, else v0x02)
+        session->useV3 = (s_apriltag != nullptr && s_apriltag->is_running());
+
         std::string header = "TaPS";
-        header.push_back(0x02); // bumped: header now includes frame count
+        header.push_back(session->useV3 ? 0x03 : 0x02);
         header.push_back(static_cast<char>(encoderType));
         session->output.write(header.c_str(), static_cast<std::streamsize>(header.length()));
         session->output.write(reinterpret_cast<const char *>(&width), sizeof(width));
@@ -291,6 +353,31 @@ private:
         session->frameCountFieldPos = session->output.tellp();
         constexpr uint64_t zeroCount = 0;
         session->output.write(reinterpret_cast<const char *>(&zeroCount), sizeof(zeroCount));
+
+        if (session->useV3) {
+            // Camera metadata: intrinsics, tag size, camera alias, tag family.
+            // Read the detector's LIVE intrinsics so a calibration performed
+            // via the web wizard mid-run is reflected in new session headers.
+            double fxH = s_atCfg.fx, fyH = s_atCfg.fy, cxH = s_atCfg.cx, cyH = s_atCfg.cy;
+            if (s_apriltag)
+                s_apriltag->intrinsics(fxH, fyH, cxH, cyH);
+            const double extras[5] = {
+                    fxH, fyH, cxH, cyH,
+                    s_atCfg.estimatePose ? s_atCfg.tagSizeMeters : 0.0
+            };
+            session->output.write(reinterpret_cast<const char *>(extras), sizeof(extras));
+
+            const unsigned int aliasLen = s_cameraAlias.length();
+            session->output.write(reinterpret_cast<const char *>(&aliasLen), sizeof(aliasLen));
+            session->output.write(s_cameraAlias.c_str(), static_cast<std::streamsize>(aliasLen));
+
+            const unsigned int familyLen = s_atCfg.family.length();
+            session->output.write(reinterpret_cast<const char *>(&familyLen), sizeof(familyLen));
+            session->output.write(s_atCfg.family.c_str(), static_cast<std::streamsize>(familyLen));
+
+            spdlog::info("Recording .taps v0x03 with AprilTag metadata (family={}, alias='{}')",
+                         s_atCfg.family, s_cameraAlias);
+        }
         session->output.flush();
 
         // parse encoder args
@@ -375,6 +462,11 @@ private:
                         // Copy the raw data
                         r.jpegData.assign(img.datastart, img.dataend);
                     }
+                    if (s->useV3 && s_apriltag) {
+                        // Detections typically complete while the frame sits in the
+                        // encoder queue; the small wait only bites at pipeline start.
+                        r.meta = packTagMeta(s_apriltag->resultsForSeq(job->captureSeq, 100));
+                    }
                     s->results[i].push(std::move(r));
                 }
                 s->results[i].close();
@@ -392,7 +484,14 @@ private:
                 s->output.write(reinterpret_cast<const char *>(&r->frameIdx), sizeof(r->frameIdx));
                 s->output.write(reinterpret_cast<const char *>(&r->ptpNs), sizeof(r->ptpNs));
                 s->output.write(reinterpret_cast<const char *>(&size), sizeof(size));
+                uint32_t metaSize = 0;
+                if (s->useV3) {
+                    metaSize = static_cast<uint32_t>(r->meta.size());
+                    s->output.write(reinterpret_cast<const char *>(&metaSize), sizeof(metaSize));
+                }
                 s->output.write(reinterpret_cast<const char *>(r->jpegData.data()), size);
+                if (s->useV3 && metaSize > 0)
+                    s->output.write(reinterpret_cast<const char *>(r->meta.data()), metaSize);
                 ++s->writtenCount;
 
                 rr = (rr + 1) % s->numEncoders;
@@ -490,6 +589,7 @@ private:
             Job job;
             job.frameIdx = session->nextFrameIdx++;
             job.ptpNs = item->ptpTimestamp.count();
+            job.captureSeq = item->seq;
             job.frame = item->frame;
             session->inboxes[session->nextWorker].push(std::move(job));
             session->nextWorker = (session->nextWorker + 1) % session->numEncoders;
@@ -509,6 +609,11 @@ private:
 
     // NEW: PPS handler for hardware timestamps
     static inline PPSHandler *s_ppsHandler = nullptr;
+
+    // NEW: AprilTag detector + .taps v0x03 header extras source
+    static inline AprilTagDetector *s_apriltag = nullptr;
+    static inline AprilTagDetector::Config s_atCfg{};
+    static inline std::string s_cameraAlias;
 
     static inline std::thread s_dispatcherThread;
 

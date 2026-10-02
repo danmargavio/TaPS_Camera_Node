@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TaPS | Camera Node</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --border-color: #334155;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --primary: #3b82f6;
+            --success: #22c55e;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            padding: 1.5rem;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 720px;
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+            overflow: hidden;
+        }
+
+        .header {
+            padding: 1.25rem 1.5rem;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .header h1 {
+            font-size: 1.25rem;
+            font-weight: 600;
+            letter-spacing: -0.025em;
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.35rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            background-color: rgba(148, 163, 184, 0.1);
+            color: var(--text-muted);
+            border: 1px solid var(--border-color);
+            transition: all 0.3s ease;
+        }
+
+        .badge.recording {
+            background-color: rgba(239, 68, 68, 0.15);
+            color: var(--danger);
+            border-color: rgba(239, 68, 68, 0.3);
+        }
+
+        .badge.saving {
+            background-color: rgba(245, 158, 11, 0.15);
+            color: var(--warning);
+            border-color: rgba(245, 158, 11, 0.3);
+        }
+
+        .badge.offline {
+            background-color: rgba(148, 163, 184, 0.08);
+            color: #475569;
+            border-color: rgba(148, 163, 184, 0.15);
+        }
+
+        .badge-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: currentColor;
+        }
+
+        .badge.recording .badge-dot {
+            animation: pulse 1.5s infinite;
+        }
+
+        .badge.saving .badge-dot {
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.3; }
+            100% { opacity: 1; }
+        }
+
+        .stream-container {
+            position: relative;
+            background-color: #000;
+            width: 100%;
+            aspect-ratio: 16 / 9;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .stream-container img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+
+        .controls {
+            padding: 1.25rem 1.5rem;
+            display: flex;
+            gap: 1rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .btn {
+            flex: 1;
+            padding: 0.85rem 1rem;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 0.5rem;
+            transition: all 0.2s ease;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn-start {
+            background-color: var(--success);
+            color: #fff;
+        }
+
+        .btn-start:hover:not(:disabled) {
+            filter: brightness(1.1);
+        }
+
+        .btn-stop {
+            background-color: var(--danger);
+            color: #fff;
+        }
+
+        .btn-stop:hover:not(:disabled) {
+            filter: brightness(1.1);
+        }
+
+        .disk-section {
+            padding: 1.25rem 1.5rem;
+        }
+
+        .disk-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.75rem;
+        }
+
+        .disk-title {
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .btn-refresh {
+            background: transparent;
+            border: 1px solid var(--border-color);
+            color: var(--text-muted);
+            padding: 0.3rem 0.6rem;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-refresh:hover {
+            color: var(--text-main);
+            border-color: var(--text-muted);
+        }
+
+        .progress-bar-bg {
+            width: 100%;
+            height: 10px;
+            background-color: #0f172a;
+            border-radius: 5px;
+            overflow: hidden;
+            margin-bottom: 0.75rem;
+        }
+
+        .progress-bar-fill {
+            height: 100%;
+            width: 0%;
+            background-color: var(--primary);
+            transition: width 0.4s ease, background-color 0.4s ease;
+        }
+
+        .disk-stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 0.5rem;
+            font-size: 0.85rem;
+        }
+
+        .stat-item {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .stat-label {
+            color: var(--text-muted);
+            font-size: 0.75rem;
+        }
+
+        .stat-value {
+            font-weight: 600;
+            margin-top: 0.2rem;
+        }
+
+        .disk-path {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 0.75rem;
+            word-break: break-all;
+        }
+
+        .sys-section {
+            padding: 0 1.5rem 1.25rem;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+        }
+
+        .sys-card {
+            background-color: #0f172a;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 0.85rem 1rem;
+        }
+
+        .sys-card-title {
+            font-size: 0.7rem;
+            font-weight: 700;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 0.5rem;
+        }
+
+        .sys-bar-bg {
+            width: 100%;
+            height: 6px;
+            background-color: #1e293b;
+            border-radius: 3px;
+            overflow: hidden;
+            margin-bottom: 0.45rem;
+        }
+
+        .sys-bar-fill {
+            height: 100%;
+            width: 0%;
+            border-radius: 3px;
+            transition: width 0.6s ease, background-color 0.4s ease;
+        }
+
+        .sys-stats {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.78rem;
+        }
+
+        .sys-pct {
+            font-weight: 700;
+            font-size: 0.95rem;
+            line-height: 1;
+            margin-bottom: 0.35rem;
+        }
+
+        /* Camera calibration status strip */
+        .calib-section {
+            padding: 0 1.5rem 1.25rem;
+        }
+
+        .calib-card {
+            background-color: #0f172a;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 0.85rem 1rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 1rem;
+            flex-wrap: wrap;
+        }
+
+        .calib-status {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            font-size: 0.85rem;
+        }
+
+        .calib-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background-color: #475569;
+            flex: none;
+        }
+
+        .calib-dot.ok { background-color: var(--success); }
+        .calib-dot.miss { background-color: var(--danger); }
+        .calib-detail { color: var(--text-muted); font-size: 0.78rem; }
+        .btn-calib {
+            background: transparent;
+            border: 1px solid var(--primary);
+            color: var(--primary);
+            padding: 0.4rem 0.9rem;
+            border-radius: 6px;
+            font-size: 0.82rem;
+            font-weight: 600;
+            cursor: pointer;
+            text-decoration: none;
+            white-space: nowrap;
+        }
+        .btn-calib:hover { background: rgba(59, 130, 246, 0.12); }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>TaPS Camera Node</h1>
+            <div id="status-badge" class="badge">
+                <span class="badge-dot"></span>
+                <span id="status-text">OFFLINE</span>
+            </div>
+        </div>
+
+        <!-- Video Stream -->
+        <div class="stream-container">
+            <img src="/stream" alt="Live Camera Stream">
+        </div>
+
+        <!-- Recording Controls -->
+        <div class="controls">
+            <button id="btn-start" class="btn btn-start" onclick="setRecording('start')">
+                ▶ Start Recording
+            </button>
+            <button id="btn-stop" class="btn btn-stop" onclick="setRecording('stop')">
+                ■ Stop Recording
+            </button>
+        </div>
+
+        <!-- Camera Calibration status -->
+        <div class="calib-section">
+            <div class="calib-card">
+                <div class="calib-status">
+                    <span id="calib-dot" class="calib-dot"></span>
+                    <span>
+                        <span id="calib-headline">Camera calibration: checking…</span><br>
+                        <span id="calib-detail" class="calib-detail"></span>
+                    </span>
+                </div>
+                <a class="btn-calib" href="/calibrate">⚙ Calibrate camera</a>
+            </div>
+        </div>
+
+        <!-- Disk Info Section -->
+        <div class="disk-section">
+            <div class="disk-header">
+                <span class="disk-title">Storage</span>
+                <button class="btn-refresh" onclick="refreshDisk()">↻ Refresh</button>
+            </div>
+
+            <div class="progress-bar-bg">
+                <div id="disk-bar" class="progress-bar-fill"></div>
+            </div>
+
+            <div id="disk-info">
+                <div class="disk-stats">
+                    <div class="stat-item"><span class="stat-label">Used</span><span class="stat-value" id="disk-used">--</span></div>
+                    <div class="stat-item"><span class="stat-label">Free</span><span class="stat-value" id="disk-free">--</span></div>
+                    <div class="stat-item"><span class="stat-label">Total</span><span class="stat-value" id="disk-total">--</span></div>
+                </div>
+                <div class="disk-path" id="disk-path">Path: --</div>
+            </div>
+        </div>
+
+        <!-- CPU + Memory -->
+        <div class="sys-section">
+            <div class="sys-card">
+                <div class="sys-card-title">CPU</div>
+                <div class="sys-pct" id="cpu-pct">--%</div>
+                <div class="sys-bar-bg">
+                    <div id="cpu-bar" class="sys-bar-fill" style="background-color:var(--primary)"></div>
+                </div>
+                <div class="sys-stats">
+                    <span id="cpu-label" style="color:var(--text-muted)">--</span>
+                </div>
+            </div>
+            <div class="sys-card">
+                <div class="sys-card-title">Memory</div>
+                <div class="sys-pct" id="mem-pct">--%</div>
+                <div class="sys-bar-bg">
+                    <div id="mem-bar" class="sys-bar-fill" style="background-color:var(--primary)"></div>
+                </div>
+                <div class="sys-stats">
+                    <span id="mem-used" style="color:var(--text-muted)">--</span>
+                    <span id="mem-total" style="color:var(--text-muted)">--</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        function barColor(pct) {
+            if (pct > 90) return 'var(--danger)';
+            if (pct > 75) return 'var(--warning)';
+            return 'var(--primary)';
+        }
+
+        // ----------------------------------------------------------------
+        //  State badge
+        // ----------------------------------------------------------------
+        const STATE_LABELS = { I: 'IDLE', R: 'RECORDING', S: 'SAVING' };
+        const STATE_CLASSES = { I: '', R: 'recording', S: 'saving' };
+
+        function applyStatus(data) {
+            const s = data.s || 'I';
+            const badge    = document.getElementById('status-badge');
+            const text     = document.getElementById('status-text');
+            const btnStart = document.getElementById('btn-start');
+            const btnStop  = document.getElementById('btn-stop');
+
+            badge.className = 'badge' + (STATE_CLASSES[s] ? ' ' + STATE_CLASSES[s] : '');
+            text.textContent = STATE_LABELS[s] || 'IDLE';
+            btnStart.disabled = (s !== 'I');
+            btnStop.disabled  = (s !== 'R');
+        }
+
+        function setOffline() {
+            document.getElementById('status-badge').className = 'badge offline';
+            document.getElementById('status-text').textContent = 'OFFLINE';
+            document.getElementById('btn-start').disabled = true;
+            document.getElementById('btn-stop').disabled  = true;
+        }
+
+        // ----------------------------------------------------------------
+        //  Disk (compact keys: t, u, f, p, path)
+        // ----------------------------------------------------------------
+        function applyDisk(d) {
+            if (d.err) {
+                document.getElementById('disk-path').textContent = 'Error reading disk';
+                return;
+            }
+            // Support both compact SSE keys and legacy REST keys
+            const pct  = d.p  ?? d.used_percent ?? 0;
+            const used = d.u  ?? d.used_bytes   ?? 0;
+            const free = d.f  ?? d.free_bytes   ?? 0;
+            const tot  = d.t  ?? d.total_bytes  ?? 0;
+            const path = d.path ?? '';
+
+            const pctStr = pct.toFixed(1);
+            const bar = document.getElementById('disk-bar');
+            bar.style.width = pctStr + '%';
+            bar.style.backgroundColor = barColor(pct);
+
+            document.getElementById('disk-used').textContent  = `${formatBytes(used)} (${pctStr}%)`;
+            document.getElementById('disk-free').textContent  = formatBytes(free);
+            document.getElementById('disk-total').textContent = formatBytes(tot);
+            if (path) document.getElementById('disk-path').textContent = `Path: ${path}`;
+        }
+
+        // ----------------------------------------------------------------
+        //  CPU (compact key: p)
+        // ----------------------------------------------------------------
+        function applyCpu(d) {
+            const pct = d.p ?? 0;
+            const pctStr = pct.toFixed(1);
+            document.getElementById('cpu-pct').textContent   = pctStr + '%';
+            document.getElementById('cpu-label').textContent = 'All cores';
+            const bar = document.getElementById('cpu-bar');
+            bar.style.width = pctStr + '%';
+            bar.style.backgroundColor = barColor(pct);
+        }
+
+        // ----------------------------------------------------------------
+        //  Memory (compact keys: t, u, f, p)
+        // ----------------------------------------------------------------
+        function applyMem(d) {
+            const pct = d.p ?? 0;
+            const pctStr = pct.toFixed(1);
+            document.getElementById('mem-pct').textContent   = pctStr + '%';
+            document.getElementById('mem-used').textContent  = formatBytes(d.u ?? 0) + ' used';
+            document.getElementById('mem-total').textContent = formatBytes(d.t ?? 0) + ' total';
+            const bar = document.getElementById('mem-bar');
+            bar.style.width = pctStr + '%';
+            bar.style.backgroundColor = barColor(pct);
+        }
+
+        // ----------------------------------------------------------------
+        //  Recording control
+        // ----------------------------------------------------------------
+        function setRecording(action) {
+            fetch('/recording', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action })
+            })
+            .catch(err => alert('Failed to execute action: ' + err));
+        }
+
+        // Manual disk refresh button
+        function refreshDisk() {
+            fetch('/disk')
+                .then(res => res.json())
+                .then(data => applyDisk(data))
+                .catch(() => {
+                    document.getElementById('disk-path').textContent = 'Error fetching disk info';
+                });
+        }
+
+        // ----------------------------------------------------------------
+        //  SSE connection
+        // ----------------------------------------------------------------
+        let sse = null;
+
+        function connectSse() {
+            if (sse) sse.close();
+            sse = new EventSource('/events');
+
+            sse.addEventListener('status', e => {
+                try { applyStatus(JSON.parse(e.data)); } catch(err) { console.error('SSE status:', err); }
+            });
+            sse.addEventListener('disk', e => {
+                try { applyDisk(JSON.parse(e.data));   } catch(err) { console.error('SSE disk:', err); }
+            });
+            sse.addEventListener('cpu', e => {
+                try { applyCpu(JSON.parse(e.data));    } catch(err) { console.error('SSE cpu:', err); }
+            });
+            sse.addEventListener('mem', e => {
+                try { applyMem(JSON.parse(e.data));    } catch(err) { console.error('SSE mem:', err); }
+            });
+
+            sse.onerror = () => {
+                setOffline();
+                // EventSource auto-retries; no manual reconnect needed.
+            };
+        }
+
+        // Camera calibration status (persisted intrinsics in calibration.json)
+        async function refreshCalib() {
+            const dot = document.getElementById('calib-dot');
+            const head = document.getElementById('calib-headline');
+            const det = document.getElementById('calib-detail');
+            try {
+                const r = await fetch('/calib/status');
+                const s = await r.json();
+                const c = s.calibration;
+                if (c) {
+                    dot.className = 'calib-dot ok';
+                    head.textContent = 'Camera calibration: present';
+                    det.textContent = `captured ${c.calibrated_at} · fx ${Number(c.fx).toFixed(1)} ` +
+                        `fy ${Number(c.fy).toFixed(1)} · reproj ${Number(c.reprojection_error_px).toFixed(3)} px ` +
+                        `· ${c.image_width}x${c.image_height}`;
+                } else {
+                    dot.className = 'calib-dot miss';
+                    head.textContent = 'Camera calibration: missing';
+                    det.textContent = 'No intrinsics stored — AprilTag poses will use default values. Click to run the guided wizard.';
+                }
+            } catch (e) {
+                dot.className = 'calib-dot';
+                head.textContent = 'Camera calibration: unknown';
+                det.textContent = '';
+            }
+        }
+        setInterval(refreshCalib, 30000);
+
+        window.onload = () => {
+            refreshDisk();  // populate disk immediately before first SSE heartbeat
+            refreshCalib();
+            connectSse();
+        };
+    </script>
+</body>
+</html>

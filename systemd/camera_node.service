@@ -1,9 +1,42 @@
+# TaPS Camera Node service
+#
+# TIME SYNC (required for sub-ms multi-camera fusion):
+#   Full PTP is NOT required. Each CameraNode must run chrony disciplined by the
+#   GPS 1PPS signal on its GPIO input (plus a coarse source for the second count).
+#
+#   Recommended /etc/chrony/conf.d/taps-pps.conf on each CameraNode:
+#     refclock PPS /dev/pps0 lock NMEA refid GPS precision 1e-7
+#     refclock SHM 0 offset 0.5 delay 0.2 refid NMEA noselect
+#   (PPS gives the fine ±10-100 ns alignment at each second edge; NMEA/NTP only
+#   needs to identify which second. See PLAN.md "Time Sync Architecture".)
+#
+#   This unit starts after chrony so frame timestamps are taken on a
+#   GPS-disciplined CLOCK_REALTIME. The CameraNode PPS handler also latches
+#   edges directly and falls back to the raw system clock if PPS is absent.
+#
+# APRILTAG (optional, local target location): add to ExecStart:
+#     --apriltag --apriltag-tag-size 0.165 --camera-alias CameraNode1
+#   Poses are recorded to .taps v0x03 and published on NT table "AprilTag".
+#   See README "AprilTag Detection".
+#
+# CAMERA CALIBRATION: run the guided wizard at http://<camera>:8080/calibrate
+#   It performs a focus check + coverage-guided checkerboard capture, then writes
+#   intrinsics to <output>/calibration.json (override with --calibration-file).
+#   Those values are loaded at startup automatically and used for AprilTag pose
+#   estimation + .taps v0x03 headers, so --apriltag-fx/-fy/-cx/-cy are NOT needed
+#   once calibrated. Explicit CLI flags override the file; if the camera
+#   resolution changes, recalibrate.
+
 [Unit]
 Description=TaPS Camera Node
-After=network.target chrony.service
+Wants=chrony.service
+After=network-online.target chrony.service
 
 [Service]
 Type=simple
+# templates/index.html and templates/calibrate.html are served relative to the
+# working directory (installed by `make install` to share/taps_camera_node/templates)
+WorkingDirectory=/usr/local/share/taps_camera_node
 ExecStart=/usr/local/bin/camera_node \
     --camera 0 \
     --fps 60 \

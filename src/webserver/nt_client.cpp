@@ -8,6 +8,7 @@
 
 #include "nt_client.h"
 #include <spdlog/spdlog.h>
+#include <cstdio>
 
 #ifdef HAVE_NT_CORE
 #include <ntcore.h>
@@ -56,7 +57,34 @@ void NTClient::start() {
         nt_StartClient(m_instance, server_address_.c_str(), nullptr);
         spdlog::info("NT client starting, connecting to {}", server_address_);
 
-        // Get the RoboRIO table
+        // Resolve a full topic ("RoboRIO/matchStart") into (table handle, key).
+        // Reading a prefixed key through a table handle would double the
+        // prefix, so split here and read the remainder key.
+        auto resolve_topic = [this](const std::string& topic,
+                                    nt_table*& table, std::string& key) {
+            std::string t = topic;
+            if (!t.empty() && t.front() == '/')
+                t.erase(0, 1);
+            const size_t slash = t.find('/');
+            std::string table_name;
+            if (slash == std::string::npos) {
+                table_name = "SmartDashboard";
+                key = t;
+            } else {
+                table_name = t.substr(0, slash);
+                key = t.substr(slash + 1);
+            }
+            table = nt_GetTable(m_instance, table_name.c_str());
+            if (!table)
+                spdlog::warn("Could not get NT table '{}' for topic '{}'", table_name, topic);
+            else
+                spdlog::info("NT trigger resolved: table='{}' key='{}'", table_name, key);
+        };
+
+        resolve_topic(match_start_topic_, m_start_table, m_start_key);
+        resolve_topic(match_end_topic_, m_end_table, m_end_key);
+
+        // The RoboRIO table remains the default for legacy lookups
         m_table = nt_GetTable(m_instance, "RoboRIO");
         if (!m_table) {
             spdlog::warn("Could not get RoboRIO table");
@@ -98,6 +126,11 @@ void NTClient::stop() {
         m_instance = nullptr;
     }
     m_table = nullptr;
+    m_tag_table = nullptr;
+    m_start_table = nullptr;
+    m_end_table = nullptr;
+    m_start_key.clear();
+    m_end_key.clear();
 #endif
 
     connected_ = false;
@@ -122,6 +155,42 @@ void NTClient::publish_health(const std::string& state, int frame_count, double 
 #endif
 }
 
+void NTClient::publish_tag_poses(const std::vector<TagDetectionResult>& tags, int64_t ptp_ns) {
+#ifdef HAVE_NT_CORE
+    if (!m_instance || !connected_) return;
+    if (!m_tag_table)
+        m_tag_table = nt_GetTable(m_instance, "AprilTag");
+    if (!m_tag_table) return;
+
+    char key[64];
+    std::vector<int64_t> ids;
+    ids.reserve(tags.size());
+
+    for (const auto& t : tags) {
+        ids.push_back(static_cast<int64_t>(t.tagId));
+        if (t.poseValid) {
+            std::snprintf(key, sizeof key, "tag_%u_pose_translation", t.tagId);
+            nt_PutDoubleArray(m_tag_table, key, t.translation, 3);
+            std::snprintf(key, sizeof key, "tag_%u_pose_rotation", t.tagId);
+            nt_PutDoubleArray(m_tag_table, key, t.rotation, 9);
+        } else {
+            std::snprintf(key, sizeof key, "tag_%u_pose_translation", t.tagId);
+            nt_PutString(m_tag_table, key, "none");
+            std::snprintf(key, sizeof key, "tag_%u_pose_rotation", t.tagId);
+            nt_PutString(m_tag_table, key, "none");
+        }
+    }
+
+    nt_PutIntegerArray(m_tag_table, "tag_ids", ids.data(), ids.size());
+    nt_PutInteger(m_tag_table, "tags_visible", static_cast<int64_t>(tags.size()));
+    nt_PutDouble(m_tag_table, "ptp_ns", static_cast<double>(ptp_ns));
+    nt_PutString(m_tag_table, "camera", local_alias_.c_str());
+#else
+    (void)tags;
+    (void)ptp_ns;
+#endif
+}
+
 void NTClient::poll_loop() {
     spdlog::debug("NT poll loop started");
 
@@ -134,10 +203,10 @@ void NTClient::poll_loop() {
             // Poll for incoming data
             nt_Poll(m_instance, 0.1);  // 100ms poll interval
 
-            // Check match start
+            // Check match start (resolved table + key, no double prefix)
             bool match_start = false;
-            if (m_table) {
-                match_start = nt_GetBoolean(m_table, match_start_topic_.c_str(), false);
+            if (m_start_table && !m_start_key.empty()) {
+                match_start = nt_GetBoolean(m_start_table, m_start_key.c_str(), false);
             }
             if (match_start && recording_callback_) {
                 spdlog::debug("NT matchStart detected");
@@ -146,8 +215,8 @@ void NTClient::poll_loop() {
 
             // Check match end
             bool match_end = false;
-            if (m_table) {
-                match_end = nt_GetBoolean(m_table, match_end_topic_.c_str(), false);
+            if (m_end_table && !m_end_key.empty()) {
+                match_end = nt_GetBoolean(m_end_table, m_end_key.c_str(), false);
             }
             if (match_end && recording_callback_) {
                 spdlog::debug("NT matchEnd detected");
