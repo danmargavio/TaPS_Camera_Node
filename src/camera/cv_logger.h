@@ -16,9 +16,12 @@ void spdlog_opencv_callback(
     const char *message);
 
 inline void spdlog_opencv_init() {
+#if CV_VERSION_MAJOR >= 5
+    // Custom sink hook exists only in OpenCV >= 5.
     cv::utils::logging::internal::replaceWriteLogMessageEx(
         spdlog_opencv_callback);
-
+#endif
+    // On OpenCV 4.x, cv::log output goes to stderr (captured by journald).
     cv::utils::logging::setLogLevel(
         cv::utils::logging::LOG_LEVEL_VERBOSE);
 }

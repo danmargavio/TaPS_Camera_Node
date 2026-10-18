@@ -163,8 +163,8 @@ bool AprilTagDetector::start() {
     m_family = fam;
 
     det->nthreads = std::max(1, m_cfg.threads);
-    det->quad_decimation = static_cast<unsigned>(std::clamp(m_cfg.quadDecimation, 1.0, 4.0));
-    det->blur = m_cfg.blur;
+    det->quad_decimate = static_cast<float>(std::clamp(m_cfg.quadDecimation, 1.0, 4.0));
+    det->quad_sigma = m_cfg.blur;
 
     apriltag_detector_add_family(det, fam);
 
@@ -180,8 +180,8 @@ bool AprilTagDetector::start() {
     });
     m_running = true;
 
-    spdlog::info("AprilTag detection enabled: family={}, threads={}, quad_decimation={}, pose={}, tag_size={}m",
-                 m_cfg.family, det->nthreads, det->quad_decimation, m_cfg.estimatePose, m_cfg.tagSizeMeters);
+    spdlog::info("AprilTag detection enabled: family={}, threads={}, quad_decimate={}, pose={}, tag_size={}m",
+                 m_cfg.family, det->nthreads, det->quad_decimate, m_cfg.estimatePose, m_cfg.tagSizeMeters);
     return true;
 #endif
 }
@@ -317,20 +317,23 @@ TagBatch AprilTagDetector::detectFrame(const cv::Mat &frameBgr, uint64_t seq, in
                         0.0, fy, cy,
                         0.0, 0.0, 1.0);
 
-    image_u8_t img{};
-    img.width = gray.cols;
-    img.height = gray.rows;
-    img.stride = static_cast<int>(gray.step);
-    img.buf = gray.data;
+    // AprilTag 3.4.x stable API: wrap the continuous grayscale buffer
+    // without copying and collect detections into a zarray.
+    image_u8_t img = {
+            .width = static_cast<uint32_t>(gray.cols),
+            .height = static_cast<uint32_t>(gray.rows),
+            .stride = static_cast<uint32_t>(gray.step),
+            .buf = gray.data,
+    };
 
     auto *det = static_cast<apriltag_detector_t *>(m_det);
-    apriltag_detections_t dets{};
-    apriltag_detector_detect(det, &img, &dets);
+    zarray_t *dets = apriltag_detector_detect(det, &img);
 
-    const size_t count = apriltag_detections_count(&dets);
-    batch.tags.reserve(std::min(count, kMaxTagsPerFrame));
-    for (size_t i = 0; i < count && batch.tags.size() < kMaxTagsPerFrame; ++i) {
-        const apriltag_detection_t *d = apriltag_detections_deref(&dets, i);
+    const int count = dets ? zarray_size(dets) : 0;
+    batch.tags.reserve(std::min<size_t>(static_cast<size_t>(count), kMaxTagsPerFrame));
+    for (int i = 0; i < count && batch.tags.size() < kMaxTagsPerFrame; ++i) {
+        apriltag_detection_t *d = nullptr;
+        zarray_get(dets, i, &d);
         if (!d) continue;
 
         TagDetectionResult r;
@@ -343,7 +346,8 @@ TagBatch AprilTagDetector::detectFrame(const cv::Mat &frameBgr, uint64_t seq, in
 
         batch.tags.push_back(r);
     }
-    apriltag_detections_destroy(&dets);
+    if (dets)
+        apriltag_detections_destroy(dets);
 
     m_tagsDetectedTotal.fetch_add(batch.tags.size());
 #else

@@ -111,6 +111,35 @@
             100% { opacity: 1; }
         }
 
+        .stream-wrap { position: relative; }
+
+        .lp-banner {
+            position: absolute;
+            inset: 0;
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: .5rem;
+            background: rgba(15, 23, 42, 0.86);
+            color: var(--warning);
+            font-size: 1.05rem;
+            font-weight: 600;
+            text-align: center;
+            padding: 1.5rem;
+            z-index: 2;
+        }
+
+        .lp-banner .lp-sub {
+            color: var(--text-muted);
+            font-weight: 400;
+            font-size: .85rem;
+        }
+
+        .btn-lowpower { background: var(--warning); color: #1c1917; cursor: pointer; }
+        .btn-lowpower.active { background: var(--danger); color: var(--text-main); }
+        .btn-lowpower:disabled { opacity: .5; cursor: progress; }
+
         .stream-container {
             position: relative;
             background-color: #000;
@@ -367,8 +396,15 @@
         </div>
 
         <!-- Video Stream -->
-        <div class="stream-container">
-            <img src="/stream" alt="Live Camera Stream">
+        <div class="stream-wrap">
+            <div class="stream-container">
+                <img id="live-stream" src="/stream" alt="Live Camera Stream">
+            </div>
+            <div id="lp-banner" class="lp-banner">
+                <span>LOW POWER MODE</span>
+                <span class="lp-sub">Camera capture and AprilTag processing are off.<br>
+                    Press "Enter Normal Mode" to resume. Web UI, PPS sync and NetworkTables stay active.</span>
+            </div>
         </div>
 
         <!-- Recording Controls -->
@@ -378,6 +414,9 @@
             </button>
             <button id="btn-stop" class="btn btn-stop" onclick="setRecording('stop')">
                 ■ Stop Recording
+            </button>
+            <button id="btn-lowpower" class="btn btn-lowpower" onclick="toggleLowPower()" disabled>
+                ⏻ Low Power: --
             </button>
         </div>
 
@@ -440,6 +479,24 @@
                 </div>
             </div>
         </div>
+
+        <!-- PPS Time Source + Power/Thermal -->
+        <div class="sys-section">
+            <div class="sys-card">
+                <div class="sys-card-title">PPS / GPS Time</div>
+                <div class="sys-pct" id="pps-state" style="color:var(--text-muted)">--</div>
+                <div class="sys-stats">
+                    <span id="pps-detail" style="color:var(--text-muted)">--</span>
+                </div>
+            </div>
+            <div class="sys-card">
+                <div class="sys-card-title">Power &amp; Thermal</div>
+                <div class="sys-pct" id="temp-val">--</div>
+                <div class="sys-stats">
+                    <span id="fault-label" style="color:var(--text-muted)">--</span>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -460,6 +517,8 @@
         // ----------------------------------------------------------------
         //  State badge
         // ----------------------------------------------------------------
+        let lowPower = false;
+
         const STATE_LABELS = { I: 'IDLE', R: 'RECORDING', S: 'SAVING' };
         const STATE_CLASSES = { I: '', R: 'recording', S: 'saving' };
 
@@ -472,7 +531,7 @@
 
             badge.className = 'badge' + (STATE_CLASSES[s] ? ' ' + STATE_CLASSES[s] : '');
             text.textContent = STATE_LABELS[s] || 'IDLE';
-            btnStart.disabled = (s !== 'I');
+            btnStart.disabled = (s !== 'I') || lowPower;
             btnStop.disabled  = (s !== 'R');
         }
 
@@ -537,6 +596,41 @@
         }
 
         // ----------------------------------------------------------------
+        //  PPS / GPS time source (keys: en,l,el,e,d,g,s,p,j)
+        // ----------------------------------------------------------------
+        function applyPps(d) {
+            const el  = document.getElementById('pps-state');
+            const det = document.getElementById('pps-detail');
+            if (!d.en) {
+                el.textContent = 'DISABLED';
+                el.style.color = 'var(--text-muted)';
+                det.textContent = d.g >= 0 ? `GPIO${d.g} unavailable — using system clock`
+                                           : 'run node with --pps-gpio N to enable';
+                return;
+            }
+            el.textContent = d.l ? 'LOCKED' : (d.el ? 'NO SIGNAL' : 'WAITING');
+            el.style.color = d.l ? 'var(--success)' : 'var(--danger)';
+            const bits = [`GPIO${d.g}`, `${d.e} edges`, `${d.d} dropouts`];
+            if (d.p) bits.push(`${d.p.toFixed(2)} ms period`, `${Math.round(d.j)} µs jitter`);
+            if (!d.l && typeof d.s === 'number') bits.push(`last edge ${d.s}s ago`);
+            det.textContent = bits.join(' · ');
+        }
+
+        // ----------------------------------------------------------------
+        //  Power & thermal (keys: t, raw, f[])
+        // ----------------------------------------------------------------
+        function applySys(d) {
+            const el = document.getElementById('temp-val');
+            const t = d.t;
+            el.textContent = (t >= 0) ? `${t.toFixed(1)}°C` : '--';
+            el.style.color = t >= 80 ? 'var(--danger)' : t >= 70 ? 'var(--warning)' : 'var(--text-main)';
+            const fl = document.getElementById('fault-label');
+            if (!Array.isArray(d.f)) { fl.textContent = 'throttle status n/a'; return; }
+            fl.textContent = d.f.length === 0 ? 'no power/throttle faults' : d.f.join(', ');
+            fl.style.color = d.f.length === 0 ? 'var(--text-muted)' : 'var(--warning)';
+        }
+
+        // ----------------------------------------------------------------
         //  Recording control
         // ----------------------------------------------------------------
         function setRecording(action) {
@@ -546,6 +640,36 @@
                 body: JSON.stringify({ action })
             })
             .catch(err => alert('Failed to execute action: ' + err));
+        }
+
+        // ----------------------------------------------------------------
+        //  Low power mode (camera capture + AprilTag gate)
+        // ----------------------------------------------------------------
+        function applyPower(d) {
+            lowPower = !!(d.lp ?? d.low_power);
+            const btn = document.getElementById('btn-lowpower');
+            btn.disabled = false;
+            btn.textContent = lowPower ? '▶ Enter Normal Mode' : '⏻ Low Power Mode';
+            btn.classList.toggle('active', lowPower);
+            document.getElementById('lp-banner').style.display = lowPower ? 'flex' : 'none';
+            const s = document.getElementById('status-text').textContent;
+            document.getElementById('btn-start').disabled = lowPower || s !== 'IDLE';
+            if (!lowPower) {
+                // Browser does not auto-reconnect a stream that died with 503
+                const img = document.getElementById('live-stream');
+                if (img) img.src = '/stream?t=' + Date.now();
+            }
+        }
+
+        function toggleLowPower() {
+            fetch('/lowpower', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enable: !lowPower })
+            })
+            .then(res => res.json())
+            .then(applyPower)
+            .catch(err => alert('Failed to toggle low power mode: ' + err));
         }
 
         // Manual disk refresh button
@@ -578,6 +702,15 @@
             });
             sse.addEventListener('mem', e => {
                 try { applyMem(JSON.parse(e.data));    } catch(err) { console.error('SSE mem:', err); }
+            });
+            sse.addEventListener('pps', e => {
+                try { applyPps(JSON.parse(e.data));    } catch(err) { console.error('SSE pps:', err); }
+            });
+            sse.addEventListener('sys', e => {
+                try { applySys(JSON.parse(e.data));    } catch(err) { console.error('SSE sys:', err); }
+            });
+            sse.addEventListener('power', e => {
+                try { applyPower(JSON.parse(e.data));  } catch(err) { console.error('SSE power:', err); }
             });
 
             sse.onerror = () => {
@@ -617,6 +750,17 @@
         window.onload = () => {
             refreshDisk();  // populate disk immediately before first SSE heartbeat
             refreshCalib();
+            fetch('/lowpower').then(r => r.json()).then(applyPower).catch(() => {
+                // Server has no /lowpower (older binary): keep the button usable
+                // so the first toggle can still be attempted; default to capturing.
+                const btn = document.getElementById('btn-lowpower');
+                btn.disabled = false;
+                btn.textContent = '⏻ Low Power Mode';
+            });
+            fetch('/system').then(r => r.json()).then(s => {
+                applyPps(s.pps || {});
+                applySys(s.sys || {});
+            }).catch(() => {});
             connectSse();
         };
     </script>

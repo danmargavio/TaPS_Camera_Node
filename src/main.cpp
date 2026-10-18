@@ -18,6 +18,7 @@
 #include "camera/pps_handler.h"
 #include "camera/fourcc.h"
 #include "camera/apriltag_detector.h"
+#include "camera/power_mode.h"
 #include "runtime_args.h"
 #include "video_queue.h"
 #include "video_recorder.h"
@@ -41,6 +42,11 @@ int main(const int argc, char *argv[]) {
 
     args::Flag enumerateOnly(parser, "enumerate", "Enumerate supported V4L2 camera modes, and exit",
                              {"enum", "enumerate"});
+    args::Flag startCapturingFlag(parser, "start-capturing",
+                                  "Boot straight into capture. Default (no flag): LOW POWER mode - "
+                                  "camera closed, AprilTag off; enable from the web UI or "
+                                  "POST {\"enable\":false} to /lowpower.",
+                                  {"start-capturing"});
     args::Flag verboseFlag(parser, "verbose", "Enable verbose logging (debug level)", {'v', "verbose"});
     args::Flag traceFlag(parser, "trace", "Enable trace logging (highest detail)", {'t', "trace"});
 
@@ -153,6 +159,11 @@ int main(const int argc, char *argv[]) {
         spdlog::set_level(spdlog::level::info);
     }
 
+    // Boot policy: LOW POWER unless --start-capturing (operator decision
+    // 2026-10-18: a reboot must land thermally quiet; capture is a deliberate
+    // action via web UI / POST /lowpower).
+    PowerMode::request(!static_cast<bool>(startCapturingFlag));
+
     flags.cameraId = args::get(cameraIdFlag);
     flags.fps = args::get(fpsFlag);
     flags.width = args::get(widthFlag);
@@ -241,6 +252,11 @@ int main(const int argc, char *argv[]) {
 
         // Set up recording callback
         ntClient.set_recording_callback([](bool start) {
+            if (start && PowerMode::isLowPower()) {
+                spdlog::warn("NT recording START ignored: node is in LOW POWER mode (camera off). "
+                             "Enable capture via the web UI first.");
+                return;
+            }
             spdlog::info("NT recording command: {}", start ? "START" : "STOP");
             VideoRecordThread::setRecording(start);
         });
@@ -298,6 +314,25 @@ int main(const int argc, char *argv[]) {
         spdlog::error("AprilTag detection could not be started; recording without tag metadata");
     }
 
+    // Freeze auto-exposure for calibration sessions (unfreeze otherwise).
+    // A second V4L2 handle adjusts controls while `cap` keeps streaming; we
+    // snapshot the live exposure first so the freeze is visually seamless.
+    const std::string videoDev = "/dev/video" + std::to_string(flags.cameraId);
+    CalibrationSession::setExposureControl([videoDev](const bool lock) {
+        VideoCapture ctl(videoDev, CAP_V4L2);
+        if (!ctl.isOpened()) { spdlog::warn("exposure control: {} not openable", videoDev); return; }
+        if (lock) {
+            double curExp = ctl.get(CAP_PROP_EXPOSURE); // live AE-chosen value
+            if (!(curExp > 0.0 && curExp <= 5000.0)) curExp = 250.0; // 25 ms fallback
+            ctl.set(CAP_PROP_AUTO_EXPOSURE, 1.0); // 1 = manual (V4L2 backend)
+            ctl.set(CAP_PROP_EXPOSURE, curExp);    // hold the value AE had just chosen
+            spdlog::info("Calibration: auto-exposure frozen (raw {})", curExp);
+        } else {
+            ctl.set(CAP_PROP_AUTO_EXPOSURE, 0.75); // 0.75 = aperture-priority auto
+            spdlog::info("Calibration: auto-exposure restored");
+        }
+    });
+
     // Apply fresh calibrations from the web wizard immediately (no restart)
     CalibrationSession::setOnSaved([&apriltagDetector](double fx, double fy, double cx, double cy) {
         apriltagDetector.updateIntrinsics(fx, fy, cx, cy);
@@ -306,7 +341,36 @@ int main(const int argc, char *argv[]) {
 
     Mat frame;
     VideoCapture cap;
-    cv_cap_setup(&cap, flags);
+    bool capOpen = false;
+
+    // Camera bring-up shared by the initial start and every low-power resume:
+    // open, apply format/fps, verify frame geometry. Releases on failure so
+    // a later retry starts clean.
+    auto openCamera = [&cap, &flags]() -> bool {
+        if (cv_cap_setup(&cap, flags) != 0 || !cap.isOpened()) {
+            cap.release();
+            return false;
+        }
+        const int gotW = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+        const int gotH = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+        if (gotH != flags.height || gotW != flags.width) {
+            spdlog::critical("frame size from camera {}x{} != expected {}x{}",
+                             gotW, gotH, flags.width, flags.height);
+            cap.release();
+            return false;
+        }
+        return true;
+    };
+
+    if (PowerMode::isLowPower()) {
+        spdlog::info("LOW POWER mode at boot: /dev/video0 stays closed, AprilTag idle. "
+                     "Web UI, PPS and NT remain reachable; POST {\"enable\":false} to /lowpower to capture.");
+    } else if (!openCamera()) {
+        spdlog::critical("camera {} unavailable at boot - exiting (systemd will restart)", flags.cameraId);
+        return 1;
+    } else {
+        capOpen = true;
+    }
 
     auto frameBuffer = VideoBuffer<TimestampedFrame>(flags.bufferMaxSize);
     auto frameBufferStream = VideoBuffer<TimestampedFrame>(flags.bufferMaxSize);
@@ -326,7 +390,7 @@ int main(const int argc, char *argv[]) {
     VideoRecordThread::setAprilTagDetector(&apriltagDetector);
 
     // Start HTTP server
-    HttpServer::begin(&frameBufferStream, flags);
+    HttpServer::begin(&frameBufferStream, flags, &ppsHandler);
 
     std::signal(SIGINT, [](const int sig) {
         std::cout << "\n";
@@ -348,15 +412,30 @@ int main(const int argc, char *argv[]) {
 
     auto start_time = chrono::high_resolution_clock::now();
 
-    if (cap.get(CAP_PROP_FRAME_HEIGHT) != flags.height || cap.get(CAP_PROP_FRAME_WIDTH) != flags.width) {
-        spdlog::critical("frame size from camera {}x{} != expected {}x{}", frame.cols, frame.rows, flags.width,
-                         flags.height);
-        VideoRecordThread::shutdown();
-        HttpServer::stop();
-        std::exit(1);
-    }
-
     for (;;) {
+        if (PowerMode::isLowPower()) {
+            if (capOpen) {
+                cap.release();
+                capOpen = false;
+                spdlog::info("low power mode: /dev/video0 released, capture stopped");
+            }
+            PowerMode::waitWhileLowPower();
+            continue;
+        }
+        if (!capOpen) {
+            spdlog::info("resuming capture: opening camera");
+            if (openCamera()) {
+                capOpen = true;
+                delta_times.clear();
+                start_time = chrono::high_resolution_clock::now();
+                spdlog::info("camera open - capturing");
+            } else {
+                spdlog::error("camera reopen failed; returning to LOW POWER mode (toggle again to retry)");
+                PowerMode::request(true);
+            }
+            continue;
+        }
+
         cap.read(frame);
 
         if (frame.empty()) {

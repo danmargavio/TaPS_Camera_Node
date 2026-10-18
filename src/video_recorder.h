@@ -8,6 +8,7 @@
 #include <chrono>
 #include <bit>
 #include <functional>
+#include <future>
 #include <thread>
 #include <vector>
 #include <deque>
@@ -477,9 +478,20 @@ private:
         session->writerThread = std::thread([s = session.get()]() {
             pthread_setname_np(pthread_self(), "vid_writer");
             unsigned rr = 0;
-            while (true) {
+            std::vector<char> slotDone(s->numEncoders, 0);
+            unsigned doneSlots = 0;
+            while (doneSlots < s->numEncoders) {
                 const auto r = s->results[rr].pop();
-                if (!r) break; // that worker is done and drained -> pipeline finished
+                // A slot yields nullopt only when that worker has exited AND
+                // its queue is empty (permanent thereafter). Keep cycling the
+                // remaining slots until every one is drained - the old
+                // break-on-first-nullopt orphaned workers blocked pushing to
+                // a full result queue whose consumer had already left.
+                if (!r) {
+                    if (!slotDone[rr]) { slotDone[rr] = 1; ++doneSlots; }
+                    rr = (rr + 1) % s->numEncoders;
+                    continue;
+                }
                 auto size = static_cast<uint32_t>(r->jpegData.size());
                 s->output.write(reinterpret_cast<const char *>(&r->frameIdx), sizeof(r->frameIdx));
                 s->output.write(reinterpret_cast<const char *>(&r->ptpNs), sizeof(r->ptpNs));
@@ -519,13 +531,28 @@ private:
         if (cb) cb(newState);
     }
 
+    // Join with a hard bound: a wedged worker must never make the Saving
+    // state permanent, nor hang process shutdown. Detaching is safe - a
+    // detached encoder only touches the Job/Result values it already owns.
+    static bool joinWithTimeout(std::thread &t, const char *what, const int index) {
+        if (!t.joinable()) return true;
+        auto done = std::make_shared<std::promise<void>>();
+        auto fut = done->get_future();
+        std::thread([tp = &t, done]() { tp->join(); done->set_value(); }).detach();
+        if (fut.wait_for(std::chrono::seconds(8)) == std::future_status::ready) return true;
+        spdlog::error("Recorder {}: {} did not stop within 8s - detaching", what, index);
+        t.detach();
+        return false;
+    }
+
     static void stopSession(const std::unique_ptr<Session> &session) {
         if (!session) return;
         notifyStateChange(RecorderState::Saving);
 
         for (auto &inbox: session->inboxes) inbox.close();
-        for (auto &encoder: session->encoders) encoder.join();
-        session->writerThread.join();
+        for (size_t i = 0; i < session->encoders.size(); ++i)
+            joinWithTimeout(session->encoders[i], "encoder", static_cast<int>(i));
+        joinWithTimeout(session->writerThread, "writer", -1);
 
         patchFrameCount(*session);
         session->output.close();

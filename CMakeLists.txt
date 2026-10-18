@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 include(FetchContent)
+find_package(PkgConfig QUIET)
 
 # Existing dependencies
 FetchContent_Declare(
@@ -40,16 +41,15 @@ else()
     set(NT_LIB "")
 endif()
 
-# Optional: libgpiod (GPIO/PPS)
+# Optional: libgpiod (GPIO/PPS) — v2 C++ bindings via pkg-config
 option(TAPS_ENABLE_PPS "Enable PPS/GPIO support" ON)
-if(TAPS_ENABLE_PPS)
-    message(STATUS "PPS/GPIO support enabled")
-    find_package(gpiod QUIET)
-    if(gpiod_FOUND)
+if(TAPS_ENABLE_PPS AND PkgConfig_FOUND)
+    pkg_check_modules(GPIOD libgpiodcxx)
+    if(GPIOD_FOUND)
         add_definitions(-DHAVE_GPIOD)
-        set(GPIOD_LIB gpiod)
+        set(GPIOD_LIB ${GPIOD_LINK_LIBRARIES})
     else()
-        message(WARNING "libgpiod not found. PPS support will be disabled at runtime.")
+        message(WARNING "libgpiodcxx not found. PPS support will be disabled at runtime.")
         set(GPIOD_LIB "")
     endif()
 else()
@@ -68,7 +68,7 @@ if(TAPS_ENABLE_APRILTAG)
     FetchContent_Declare(
             apriltag
             GIT_REPOSITORY https://github.com/AprilRobotics/apriltag.git
-            GIT_TAG 3.4.3
+            GIT_TAG v3.4.3
             GIT_SHALLOW TRUE
     )
     FetchContent_MakeAvailable(apriltag)
@@ -80,9 +80,14 @@ else()
     set(APRILTAG_LIB "")
 endif()
 
-find_package(OpenCV 5.0 REQUIRED)
+# OpenCV >= 4.5 (Raspberry Pi OS trixie ships 4.10; 5.x also accepted).
+find_package(OpenCV 4.5 REQUIRED)
 find_package(spdlog REQUIRED)
-find_package(LibHttpServer REQUIRED)
+# libhttpserver (>= 2.0 API: create_webserver/register_path/value-typed
+# http_response). Autotools project: discovered via pkg-config, typically
+# built from source (tag 2.0.0) and installed to /usr/local.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBHTTPSERVER REQUIRED libhttpserver)
 
 add_executable(
         TaPS_CameraNode
@@ -115,7 +120,7 @@ target_link_libraries(TaPS_CameraNode PRIVATE
         ${OpenCV_LIBS}
         spdlog::spdlog
         taywee::args
-        httpserver
+        ${LIBHTTPSERVER_LINK_LIBRARIES}
         nlohmann_json::nlohmann_json
         ${NT_LIB}
         ${GPIOD_LIB}
@@ -123,8 +128,11 @@ target_link_libraries(TaPS_CameraNode PRIVATE
 )
 
 target_include_directories(TaPS_CameraNode PRIVATE
-        ${libhttpserver_SOURCE_DIR}/src
-        ${libhttpserver_BINARY_DIR}/src
+        ${LIBHTTPSERVER_INCLUDE_DIRS}
+)
+
+target_link_directories(TaPS_CameraNode PRIVATE
+        ${LIBHTTPSERVER_LIBRARY_DIRS}
 )
 
 # Install
@@ -132,3 +140,14 @@ install(TARGETS TaPS_CameraNode DESTINATION bin)
 # Web UI templates (served relative to the process working directory —
 # set systemd WorkingDirectory to ${CMAKE_INSTALL_PREFIX}/share/taps_camera_node)
 install(DIRECTORY templates/ DESTINATION share/taps_camera_node/templates)
+
+# -----------------------------------------------------------------------------
+# Optional: synthetic V4L2 test feeder (needs v4l2loopback at runtime)
+# -----------------------------------------------------------------------------
+option(TAPS_BUILD_TESTFEED "Build the synthetic V4L2 test feeder tool" OFF)
+if(TAPS_BUILD_TESTFEED)
+    add_executable(TaPS_TestFeed tools/TaPS_TestFeed.cpp)
+    target_link_libraries(TaPS_TestFeed PRIVATE ${OpenCV_LIBS})
+    target_include_directories(TaPS_TestFeed PRIVATE ${OpenCV_INCLUDE_DIRS})
+    install(TARGETS TaPS_TestFeed DESTINATION bin)
+endif()

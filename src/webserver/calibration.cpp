@@ -199,6 +199,25 @@ void CalibrationSession::setOnSaved(std::function<void(double, double, double, d
     s_onSaved = std::move(cb);
 }
 
+void CalibrationSession::setExposureControl(std::function<void(bool)> cb) {
+    std::lock_guard lock(s_cbMutex);
+    s_exposureControl = std::move(cb);
+}
+
+void CalibrationSession::applyExposure(const bool lock) {
+    std::function<void(bool)> cb;
+    {
+        std::lock_guard l(s_cbMutex);
+        cb = s_exposureControl;
+    }
+    if (!cb) return;
+    try {
+        cb(lock);
+    } catch (const std::exception &e) {
+        spdlog::warn("Calibration exposure control failed ({}): {}", lock ? "lock" : "release", e.what());
+    }
+}
+
 const char *CalibrationSession::stageName(const Stage s) {
     switch (s) {
         case Stage::Focus: return "focus";
@@ -226,7 +245,7 @@ void CalibrationSession::clearCollectedLocked() {
     for (int &t: s_tilts) t = 0;
     s_hadPrev = false;
     s_prevCorners.clear();
-    s_lastRegion = s_lastTilt = -1;
+    s_cellCooldown.fill({});
     s_lastTotal = 0;
     if (!s_tmpDir.empty()) {
         std::error_code ec;
@@ -387,7 +406,7 @@ void CalibrationSession::collectPass(const cv::Mat &gray, const cv::Mat &frameBg
             reject = "hold the board steady";
             s_hadPrev = false;
         } else if (s_cells[region] >= kCellGoal && !tiltNeeded) {
-            reject = "region full";
+            reject = "region full - try a different tilt (lean top/bottom edge away)";
         } else if (now - s_cellCooldown[region] < std::chrono::milliseconds(1000)) {
             reject = "too soon after last capture here - try a new spot";
         } else if ([&] {
@@ -639,6 +658,9 @@ void CalibrationSession::workerLoop() {
         // so a stalled camera cannot delay calibration compute.
         if (st == Stage::Processing) {
             processCollected();
+            // Restore auto-exposure once the solve has run (Done or Failed).
+            if (const Stage after = stage(); after == Stage::Done || after == Stage::Failed)
+                applyExposure(false);
             continue;
         }
         if (frame.empty() || (st != Stage::Focus && st != Stage::Collect))
@@ -692,17 +714,20 @@ json CalibrationSession::statusJson() {
         for (const int t: s_tilts) tilts.push_back(t);
         int total = 0;
         bool goalsMet = true, earlyOk = s_lastTotal >= kMinTotal;
+        bool allFull = true;
         int nonFrontCats = 0;
         for (int i = 0; i < 9; ++i) {
             total += s_cells[i];
             if (s_cells[i] < kCellGoal) goalsMet = false;
+            if (s_cells[i] < kCellGoal) allFull = false;
             if (s_cells[i] < 1) earlyOk = false;
         }
         for (int i = 0; i < 5; ++i) {
             if (s_tilts[i] < kTiltGoal) goalsMet = false;
             if (i != TILT_FRONT && s_tilts[i] > 0) nonFrontCats++;
         }
-        earlyOk = earlyOk && nonFrontCats >= 2;
+        // Mirrors the 'finish' gate in control(): full FOV coverage also ok.
+        earlyOk = earlyOk && (nonFrontCats >= 2 || allFull);
         j["collect"] = {
                 {"cells", cells},
                 {"cell_goal", kCellGoal},
@@ -753,6 +778,7 @@ json CalibrationSession::control(const json &body) {
         spdlog::info("Calibration started: pattern {}x{} inner corners, square {} mm",
                      s_patternW, s_patternH, s_squareMm);
         setStage(Stage::Focus);
+        applyExposure(true); // freeze AE for stable corners + steady fps
         s_worker = std::thread(workerLoop);
         return {{"ok", true}};
     }
@@ -774,7 +800,13 @@ json CalibrationSession::control(const json &body) {
             int nonFrontCats = 0;
             for (int i = 0; i < 9; ++i) total += s_cells[i];
             for (int i = 1; i < 5; ++i) if (s_tilts[i] > 0) nonFrontCats++;
-            ok = total >= kMinTotal && nonFrontCats >= 2;
+            bool allFull = true;
+            for (int i = 0; i < 9; ++i) {
+                if (s_cells[i] < kCellGoal) allFull = false;
+            }
+            // Full FOV coverage excuses the non-frontal-tilt requirement: a
+            // user cannot always reach every orientation (see tiltCategory).
+            ok = total >= kMinTotal && (nonFrontCats >= 2 || allFull);
             for (int i = 0; i < 9 && ok; ++i) if (s_cells[i] < 1) ok = false;
         }
         if (!ok)
@@ -789,6 +821,7 @@ json CalibrationSession::control(const json &body) {
         s_frameCv.notify_all();
         if (s_worker.joinable()) s_worker.join();
         s_stop.store(false);
+        applyExposure(false);
         {
             std::lock_guard lock(s_stateMutex);
             clearCollectedLocked();

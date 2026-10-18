@@ -1,18 +1,18 @@
 //
-// PPS Handler Implementation
+// PPS Handler Implementation (libgpiod v2 C++ bindings)
 //
 
 #include "pps_handler.h"
 #include <spdlog/spdlog.h>
+#include <cmath>
 
-#ifdef __linux__
+#ifdef HAVE_GPIOD
 #include <gpiod.hpp>
 #endif
 
 PPSHandler::PPSHandler(int gpio_pin)
-    : gpio_pin_(gpio_pin), running_(false), pps_available_(false) {
-    latest_pps_time_ = std::chrono::high_resolution_clock::now().time_since_epoch();
-    system_clock_offset_ = std::chrono::nanoseconds(0);
+    : gpio_pin_(gpio_pin) {
+    latest_pps_time_ = std::chrono::system_clock::now().time_since_epoch();
 }
 
 PPSHandler::~PPSHandler() {
@@ -25,110 +25,147 @@ bool PPSHandler::initialize() {
         return false;
     }
 
-#ifdef __linux__
+#ifdef HAVE_GPIOD
     try {
-        // Open GPIO chip (typically /dev/gpiochip0)
-        chip_ = std::make_unique<gpiod::chip>("gpiochip0");
-        if (!chip_) {
-            spdlog::warn("Could not open gpiochip0, falling back to system clock");
-            return false;
-        }
+        // Open the GPIO chip (GPIOs on gpiochip0 for BCM pins on Pi).
+        chip_ = std::make_unique<gpiod::chip>("/dev/gpiochip0");
 
-        // Request the line as input with rising edge event
-        line_ = chip_->get_line(gpio_pin_);
-        if (!line_) {
-            spdlog::warn("Could not get GPIO line {}, falling back to system clock", gpio_pin_);
-            return false;
-        }
+        // Rising-edge events timestamped by the kernel CLOCK_REALTIME —
+        // disciplined by chrony once the GPS PPS source is configured.
+        // Internal pull-up: GPS PPS outputs are commonly open-collector and
+        // float otherwise (confirmed needed on this carrier).
+        gpiod::line_settings settings;
+        settings.set_direction(gpiod::line::direction::INPUT)
+                .set_edge_detection(gpiod::line::edge::RISING)
+                .set_event_clock(gpiod::line::clock::REALTIME)
+                .set_bias(gpiod::line::bias::PULL_UP);
 
-        // Configure as input
-        line_.release();
-        line_ = chip_->request_line(gpiod::line_request{
-            .function = "pps",
-            .consumer = "taps_camera",
-            .request_type = gpiod::line_request::REQUEST_TYPE_EVENT,
-            .event_settings = gpiod::line_request::event_settings{
-                .base = gpio_pin_,
-                .flags = gpiod::line_request::event_flags::EDGE_RISING,
-                .buffer_size = 1024,
-            }
-        });
+        request_ = std::make_unique<gpiod::line_request>(
+            chip_->prepare_request()
+                .set_consumer("taps_camera")
+                .set_event_buffer_size(1024)
+                .add_line_settings(static_cast<unsigned int>(gpio_pin_), settings)
+                .do_request());
 
-        if (!line_) {
-            spdlog::warn("Could not request GPIO line {} for PPS, falling back", gpio_pin_);
-            return false;
-        }
-
-        spdlog::info("PPS handler initialized on GPIO {}", gpio_pin_);
+        spdlog::info("PPS handler initialized on gpiochip0 line {}", gpio_pin_);
         pps_available_ = true;
         running_ = true;
-
-        // Start background monitoring thread
-        std::thread(&PPSHandler::pps_monitor_loop, this).detach();
+        monitor_thread_ = std::thread(&PPSHandler::pps_monitor_loop, this);
         return true;
 
-    } catch (const std::exception& e) {
+    } catch (const std::exception &e) {
         spdlog::warn("PPS init error: {}. Falling back to system clock.", e.what());
+        request_.reset();
+        chip_.reset();
+        pps_available_ = false;
         return false;
     }
 #else
-    // Not Linux - use system clock
-    spdlog::warn("PPS handler only supported on Linux, using system clock");
+    spdlog::warn("Built without libgpiod — using system clock for timestamps");
     return false;
 #endif
 }
 
 std::chrono::nanoseconds PPSHandler::get_timestamp() {
-    // If PPS is available, return the latest PPS-synced timestamp
-    // Otherwise return system clock time
-    if (pps_available_) {
+    if (pps_available_ && have_edge_.load()) {
         std::lock_guard<std::mutex> lock(pps_mutex_);
-        return latest_pps_time_;
+        // Real-time of the last edge + monotonic elapsed since it. Smooth and
+        // strictly increasing at any frame rate; immune to clock steps between
+        // edges. Fresh edges pull it back onto the GPS second boundary.
+        const auto mono_now =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch());
+        return latest_pps_time_ + (mono_now - edge_monotonic_);
     }
-    return std::chrono::high_resolution_clock::now().time_since_epoch();
+    return std::chrono::system_clock::now().time_since_epoch();
 }
 
 void PPSHandler::shutdown() {
     running_ = false;
-#ifdef __linux__
-    if (line_) {
-        line_.release();
-    }
+    if (monitor_thread_.joinable())
+        monitor_thread_.join();
+
+#ifdef HAVE_GPIOD
+    try {
+        if (request_) request_->release();
+    } catch (...) { /* already released by destructor */ }
+    request_.reset();
     chip_.reset();
-    line_.reset();
 #endif
+    pps_available_ = false;
     spdlog::debug("PPS handler shutdown");
 }
 
 void PPSHandler::pps_monitor_loop() {
     spdlog::debug("PPS monitor thread started");
 
-#ifdef __linux__
+#ifdef HAVE_GPIOD
+    gpiod::edge_event_buffer buffer(32);
+    bool signal_lost_logged = false;
     while (running_) {
         try {
-            // Wait for rising edge event with timeout
-            auto event = line_.wait(std::chrono::milliseconds(100));
-
-            if (!event) {
-                continue; // Timeout, continue waiting
+            if (!request_ || !request_->wait_edge_events(std::chrono::milliseconds(100))) {
+                // Watchdog: PPS expected every second. Warn once when it stops
+                // (weak GPS fix), report again when it returns.
+                if (have_edge_.load() && !signal_lost_logged) {
+                    std::lock_guard<std::mutex> lock(pps_mutex_);
+                    const auto since =
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch()) -
+                            edge_monotonic_;
+                    if (since > std::chrono::milliseconds(2500)) {
+                        signal_lost_logged = true;
+                        dropout_count_.fetch_add(1, std::memory_order_relaxed);
+                        spdlog::warn("PPS signal lost ({:.1f}s since last edge); timestamps "
+                                     "hold local-clock pacing until it returns",
+                                     std::chrono::duration<double>(since).count());
+                    }
+                }
+                continue;
             }
 
-            if (event.type() == gpiod::line_event::TYPE_EDGE_RISING) {
-                // Record the PPS timestamp
-                auto now = std::chrono::high_resolution_clock::now().time_since_epoch();
+            const std::size_t n = request_->read_edge_events(buffer);
+            for (std::size_t i = 0; i < n; ++i) {
+                const gpiod::edge_event &ev = buffer.get_event(static_cast<unsigned int>(i));
+                if (ev.type() != gpiod::edge_event::event_type::RISING_EDGE)
+                    continue;
+
+                // Kernel REALTIME timestamp of the exact edge, in ns.
+                const auto edge_ns = std::chrono::nanoseconds(ev.timestamp_ns().ns());
+                // Same-instant monotonic reading for between-edge interpolation.
+                const auto mono =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch());
                 {
                     std::lock_guard<std::mutex> lock(pps_mutex_);
-                    latest_pps_time_ = now;
+                    // Period/jitter tracking: only gaps that look like genuine
+                    // consecutive seconds (dropouts are excluded by the window).
+                    if (have_edge_.load()) {
+                        const double gap_s =
+                                std::chrono::duration<double>(edge_ns - latest_pps_time_).count();
+                        if (gap_s > 0.9 && gap_s < 1.1) {
+                            const double prev_p = ema_period_ms_.load(std::memory_order_relaxed);
+                            const double prev_j = ema_jitter_us_.load(std::memory_order_relaxed);
+                            const double period_ms = gap_s * 1000.0;
+                            ema_period_ms_.store(prev_p > 0 ? prev_p * 0.8 + period_ms * 0.2 : period_ms,
+                                                 std::memory_order_relaxed);
+                            const double jit_us = std::abs(period_ms - 1000.0) * 1000.0;
+                            ema_jitter_us_.store(prev_j > 0 ? prev_j * 0.8 + jit_us * 0.2 : jit_us,
+                                                 std::memory_order_relaxed);
+                        }
+                    }
+                    latest_pps_time_ = edge_ns;
+                    edge_monotonic_ = mono;
                 }
-
-                // Calculate offset from system clock for precision timing
-                // The PPS edge marks the exact start of a second
-                auto ns_in_second = now.count() % 1'000'000'000;
-                if (ns_in_second < 10'000'000) { // Within 10ms of second boundary
-                    system_clock_offset_ = std::chrono::nanoseconds(-static_cast<int64_t>(ns_in_second));
+                edge_count_.fetch_add(1, std::memory_order_relaxed);
+                if (!have_edge_.exchange(true))
+                    spdlog::info("PPS LOCKED: first 1PPS edge at realtime ns {}", edge_ns.count());
+                else if (signal_lost_logged) {
+                    signal_lost_logged = false;
+                    spdlog::info("PPS reacquired after dropout");
                 }
             }
-        } catch (const std::exception& e) {
+        } catch (const std::exception &e) {
             spdlog::error("PPS monitor error: {}", e.what());
             if (!running_) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -137,4 +174,25 @@ void PPSHandler::pps_monitor_loop() {
 #endif
 
     spdlog::debug("PPS monitor thread stopped");
+}
+
+PPSHandler::Stats PPSHandler::stats() const {
+    Stats st;
+    st.configured = gpio_pin_ >= 0;
+    st.available = pps_available_.load();
+    st.edges = edge_count_.load(std::memory_order_relaxed);
+    st.dropouts = dropout_count_.load(std::memory_order_relaxed);
+    st.period_ms = ema_period_ms_.load(std::memory_order_relaxed);
+    st.jitter_us = ema_jitter_us_.load(std::memory_order_relaxed);
+    st.pin = gpio_pin_;
+    st.ever_locked = have_edge_.load();
+    if (have_edge_.load()) {
+        std::lock_guard<std::mutex> lock(pps_mutex_);
+        const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch());
+        const auto since = now - edge_monotonic_;
+        st.since_edge_s = std::chrono::duration<double>(since).count();
+        st.locked = st.since_edge_s < 2.5;
+    }
+    return st;
 }

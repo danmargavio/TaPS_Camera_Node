@@ -17,6 +17,9 @@
 #include <vector>
 #include <sys/statvfs.h>
 #include <filesystem>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #include <httpserver.hpp>
 #include <opencv2/imgproc.hpp>
@@ -29,6 +32,8 @@
 #include "../video_recorder.h"
 #include "../video_queue.h"
 #include "../taps_reader/taps_reader.h"
+#include "../camera/pps_handler.h"
+#include "../camera/power_mode.h"
 #include "calibration.h"
 
 using namespace httpserver;
@@ -36,9 +41,11 @@ using json = nlohmann::json;
 
 class HttpServer {
 public:
-    static void begin(VideoBuffer<TimestampedFrame> *frameBuffer, const RuntimeArgs &flags) {
+    static void begin(VideoBuffer<TimestampedFrame> *frameBuffer, const RuntimeArgs &flags,
+                      const PPSHandler *pps = nullptr) {
         s_dataPath = flags.outputDir.empty() ? "/" : flags.outputDir;
         s_frameBuffer = frameBuffer;
+        s_pps = pps;
 
         s_previewWidth = flags.jpegStreamWidth;
         s_previewHeight = flags.jpegStreamHeight;
@@ -58,7 +65,9 @@ public:
 
         s_ws->register_path("/status", std::make_unique<StatusResource>());
         s_ws->register_path("/recording", std::make_unique<RecordingResource>());
+        s_ws->register_path("/lowpower", std::make_unique<LowPowerResource>());
         s_ws->register_path("/disk", std::make_unique<DiskResource>());
+        s_ws->register_path("/system", std::make_unique<SystemResource>());
         s_ws->register_path("/stream", std::make_unique<StreamResource>());
         s_ws->register_path("/grid-stream", std::make_unique<GridStreamResource>());  // NEW
         s_ws->register_path("/events", std::make_unique<SseResource>());
@@ -188,7 +197,12 @@ private:
     }
 
     static json buildStatusPayload() {
-        return json{{"s", stateString(VideoRecordThread::getState())}};
+        return json{{"s", stateString(VideoRecordThread::getState())},
+                    {"lp", PowerMode::isLowPower()}};
+    }
+
+    static json powerJson() {
+        return json{{"low_power", PowerMode::isLowPower()}};
     }
 
     static json buildDiskPayload() {
@@ -214,6 +228,93 @@ private:
         const double pct = totalKb ? std::round(1000.0 * usedKb / totalKb) / 10.0 : 0.0;
         return json{{"t", totalKb * 1024}, {"u", usedKb * 1024},
                     {"f", availKb * 1024}, {"p", pct}};
+    }
+
+    static json buildPpsPayload() {
+        if (!s_pps)
+            return json{{"en", false}};
+        const auto st = s_pps->stats();
+        json j;
+        j["en"] = st.available;
+        j["l"] = st.locked;
+        j["el"] = st.ever_locked;
+        j["e"] = st.edges;
+        j["d"] = st.dropouts;
+        j["g"] = st.pin;
+        if (st.since_edge_s >= 0) j["s"] = std::round(st.since_edge_s * 10.0) / 10.0;
+        if (st.period_ms > 0) {
+            j["p"] = std::round(st.period_ms * 100.0) / 100.0;
+            j["j"] = std::round(st.jitter_us);
+        }
+        return j;
+    }
+
+    // SoC temperature: pick the zone whose type names the CPU/SoC
+    // (thermal_zone0 on most Pi kernels; fall back to any zone0).
+    static double readSocTempC() {
+        const fs::path base{"/sys/class/thermal"};
+        std::error_code ec;
+        for (const auto &entry: fs::directory_iterator(base, ec)) {
+            const auto name = entry.path().filename().string();
+            if (name.rfind("thermal_zone", 0) != 0) continue;
+            std::ifstream tf(entry.path() / "type");
+            std::string type;
+            std::getline(tf, type);
+            if (type.find("cpu") == std::string::npos && type.find("soc") == std::string::npos &&
+                type.find("SoC") == std::string::npos)
+                continue;
+            std::ifstream vf(entry.path() / "temp");
+            double milli = 0;
+            if (vf >> milli) return milli / 1000.0;
+        }
+        std::ifstream vf(base / "thermal_zone0/temp");
+        double milli = 0;
+        if (vf >> milli) return milli / 1000.0;
+        return -1;
+    }
+
+    // Throttle/undervoltage state via vcgencmd, cached 5 s (popen is not free).
+    // Bit layout (RPi get_throttled): current: 0=undervolt 1=freq cap 2=throttle
+    // 3=soft temp cap 4=hard throttle; bits 16..20 = latched history.
+    static json buildSysPayload() {
+        json j;
+        j["t"] = readSocTempC();
+
+        static std::mutex s_thLock;
+        static std::chrono::steady_clock::time_point s_thAt{};
+        static uint32_t s_thRaw = 0;
+        static bool s_thOk = false;
+        {
+            std::lock_guard lock(s_thLock);
+            if (std::chrono::steady_clock::now() - s_thAt > std::chrono::seconds(5)) {
+                s_thAt = std::chrono::steady_clock::now();
+                s_thOk = false;
+                if (FILE *fp = popen("vcgencmd get_throttled 2>/dev/null", "r")) {
+                    char buf[128] = {};
+                    if (fgets(buf, sizeof(buf), fp) && strncmp(buf, "throttled=", 10) == 0) {
+                        s_thRaw = static_cast<uint32_t>(strtoul(buf + 10, nullptr, 16));
+                        s_thOk = true;
+                    }
+                    pclose(fp);
+                }
+            }
+        }
+        if (s_thOk) {
+            j["raw"] = "0x" + [] (uint32_t v) { char b[12]; snprintf(b, sizeof b, "%x", v); return std::string(b); }(s_thRaw);
+            json faults = json::array();
+            if (s_thRaw & 0x1)  faults.push_back("undervoltage");
+            if (s_thRaw & 0x2)  faults.push_back("arm_freq_capped");
+            if (s_thRaw & 0x4)  faults.push_back("throttled");
+            if (s_thRaw & 0x8)  faults.push_back("soft_temp_limit");
+            if (s_thRaw & 0x10) faults.push_back("hard_throttle");
+            if (s_thRaw & 0x10000) faults.push_back("undervoltage_history");
+            if (s_thRaw & 0x20000) faults.push_back("freq_capped_history");
+            if (s_thRaw & 0x40000) faults.push_back("throttle_history");
+            if (s_thRaw & 0x80000) faults.push_back("soft_temp_history");
+            if (s_thRaw & 0x100000) faults.push_back("hard_throttle_history");
+            j["f"] = faults;
+        }
+        return j;
     }
 
     static std::string makeSseFrame(const std::string &eventName, const json &payload) {
@@ -252,6 +353,9 @@ private:
             broadcastEvent("cpu", buildCpuPayload());
             broadcastEvent("mem", buildMemPayload());
             broadcastEvent("disk", buildDiskPayload());
+            broadcastEvent("pps", buildPpsPayload());
+            broadcastEvent("sys", buildSysPayload());
+            broadcastEvent("power", json{{"lp", PowerMode::isLowPower()}});
         }
         spdlog::info("SSE heartbeat thread exited");
     }
@@ -269,9 +373,11 @@ private:
     static inline bool s_composeGrid = true;
 
     static inline VideoBuffer<TimestampedFrame> *s_frameBuffer = nullptr;
+    static inline const PPSHandler *s_pps = nullptr;
     static inline std::atomic<bool> s_running{false};
     static inline std::thread s_encodeThread;
     static inline std::thread s_gridThread;
+    static inline std::atomic<bool> s_gridRunning{false};
 
     static inline int s_previewWidth = 640;
     static inline int s_previewHeight = 480;
@@ -286,8 +392,7 @@ private:
         const std::vector<int> jpegParams = {cv::IMWRITE_JPEG_QUALITY, s_jpegQuality};
 
         const double scale = static_cast<double>(s_previewWidth) / 360.0;
-        const double fontScale = std::clamp(scale, 0.5, 4.0);
-        const int thickness = std::max(1, static_cast<int>(2 * fontScale));
+        (void)scale; // preview is unadorned; kept for future overlay use
 
         cv::Mat resized;
         while (s_running) {
@@ -298,21 +403,15 @@ private:
             CalibrationSession::submitFrame(maybe->frame);
 
             auto now = std::chrono::steady_clock::now();
-            auto wallNow = std::chrono::system_clock::now();
-
             if (now < next) continue;
             next = now + interval;
 
+            // Preview is intentionally unadorned: no burned-in clock or OSD.
+            // Time lives in .taps metadata (and the web UI's HTML chrome),
+            // not over pixels that may carry useful scene information.
             cv::resize(maybe->frame, resized,
                        cv::Size{s_previewWidth, s_previewHeight},
                        0, 0, cv::INTER_NEAREST);
-
-            std::string timeStr = std::format("{:%Y-%m-%d %H:%M:%S}", wallNow);
-
-            cv::putText(resized, timeStr,
-                        cv::Point{20, resized.rows - 20},
-                        cv::FONT_HERSHEY_PLAIN, fontScale,
-                        cv::Scalar{255, 0, 0}, thickness, cv::LINE_4);
 
             std::vector<uint8_t> buf;
             if (!cv::imencode(".jpg", resized, buf, jpegParams)) {
@@ -393,7 +492,8 @@ private:
     }
 
     static json statusJson() {
-        return json{{"recording", VideoRecordThread::getState()}};
+        return json{{"recording", VideoRecordThread::getState()},
+                    {"low_power", PowerMode::isLowPower()}};
     }
 
     static http_response jsonResponse(const json &j, const int code = 200) {
@@ -431,6 +531,10 @@ private:
                 return errorResponse("missing or invalid 'action' field");
             }
             if (const std::string action = parsed["action"].get<std::string>(); action == "start") {
+                if (PowerMode::isLowPower()) {
+                    spdlog::warn("HTTP: recording start refused - LOW POWER mode (camera off)");
+                    return jsonResponse(json{{"error", "low power mode: camera is off - disable low power first"}}, 409);
+                }
                 if (VideoRecordThread::getState() == VideoRecordThread::RecorderState::Idle) {
                     VideoRecordThread::setRecording(true);
                     spdlog::info("HTTP: start recording requested");
@@ -451,10 +555,51 @@ private:
         }
     };
 
+    // Low power mode: camera capture + AprilTag processing can be parked to
+    // cut thermal load while the node sits offline. HTTP/SSE, PPS and NT
+    // stay alive; the capture loop releases /dev/video0 and waits.
+    class LowPowerResource : public http_resource {
+    public:
+        http_response render_get(const http_request &) override {
+            return jsonResponse(powerJson());
+        }
+
+        http_response render_post(const http_request &req) override {
+            json parsed;
+            try {
+                parsed = json::parse(std::string(req.get_content()));
+            } catch (const json::parse_error &e) {
+                spdlog::warn("HTTP: malformed /lowpower body: {}", e.what());
+                return errorResponse("invalid JSON body");
+            }
+            if (!parsed.contains("enable") || !parsed["enable"].is_boolean()) {
+                return errorResponse("missing or invalid 'enable' boolean");
+            }
+            const bool lowPower = parsed["enable"].get<bool>();
+            if (lowPower &&
+                VideoRecordThread::getState() == VideoRecordThread::RecorderState::Recording) {
+                // Close the open .taps cleanly BEFORE the camera is released.
+                VideoRecordThread::setRecording(false);
+                spdlog::info("HTTP: recording stopped ahead of low power mode");
+            }
+            PowerMode::request(lowPower);
+            spdlog::info("HTTP: low power mode {}", lowPower ? "ENABLED - camera released" : "disabled - capture resuming");
+            broadcastEvent("power", powerJson());
+            return jsonResponse(powerJson());
+        }
+    };
+
     class DiskResource : public http_resource {
     public:
         http_response render_get(const http_request &) override {
             return jsonResponse(diskUsageJson());
+        }
+    };
+
+    class SystemResource : public http_resource {
+    public:
+        http_response render_get(const http_request &) override {
+            return jsonResponse(json{{"pps", buildPpsPayload()}, {"sys", buildSysPayload()}});
         }
     };
 
@@ -494,11 +639,16 @@ private:
 
             if (req.get_args().contains(std::string_view("thumb"))) {
                 auto reader = TaPS_Reader(target);
-                auto [encoding, width, height, target_fps, encoder_args, frame_count] = reader.get_header();
+                // Serve the first stored frame as the thumbnail image.
                 auto frame = TaPS_Reader::Frame{};
                 reader.read_next_frame(frame);
                 reader.close();
-                return http_response::string(std::string(frame.data.begin(), frame.data.end()));
+                const std::string_view mime =
+                    reader.get_header().encoding == TaPS_Reader::EncoderType::RAW
+                        ? "application/octet-stream" : "image/jpeg";
+                return http_response::string(std::string(frame.data.begin(), frame.data.end()),
+                                             std::string(mime))
+                        .with_header("Content-Disposition", "inline; filename=thumb.jpg");
             }
 
             return http_response::string(target.string(), "application/octet-stream");
@@ -560,6 +710,9 @@ private:
                 uint64_t idle2, total2;
                 readCpuTicks(idle2, total2);
                 client->messages.push(makeSseFrame("cpu", json{{"p", 0.0}}));
+                client->messages.push(makeSseFrame("pps", buildPpsPayload()));
+                client->messages.push(makeSseFrame("sys", buildSysPayload()));
+                client->messages.push(makeSseFrame("power", json{{"lp", PowerMode::isLowPower()}}));
             }
 
             auto producer = [client](std::uint64_t, char *buf, const std::size_t max) -> ssize_t {
@@ -681,9 +834,13 @@ private:
                 spdlog::warn("HTTP: malformed /calib/control body: {}", e.what());
                 return errorResponse("invalid JSON body");
             }
-            if (parsed.value("action", "") == "start" &&
-                VideoRecordThread::getState() != VideoRecordThread::RecorderState::Idle) {
-                return errorResponse("recording/saving in progress - stop recording before calibrating");
+            if (parsed.value("action", "") == "start") {
+                if (PowerMode::isLowPower()) {
+                    return jsonResponse(json{{"error", "low power mode: camera is off - disable low power before calibrating"}}, 409);
+                }
+                if (VideoRecordThread::getState() != VideoRecordThread::RecorderState::Idle) {
+                    return errorResponse("recording/saving in progress - stop recording before calibrating");
+                }
             }
             return jsonResponse(CalibrationSession::control(parsed));
         }

@@ -1,64 +1,90 @@
 # TaPS Camera Node service
 #
-# TIME SYNC (required for sub-ms multi-camera fusion):
-#   Full PTP is NOT required. Each CameraNode must run chrony disciplined by the
-#   GPS 1PPS signal on its GPIO input (plus a coarse source for the second count).
+# INSTALL (production unit name is taps-camera-node.service):
+#   sudo install -m 644 systemd/camera_node.service \
+#       /etc/systemd/system/taps-camera-node.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now taps-camera-node
 #
-#   Recommended /etc/chrony/conf.d/taps-pps.conf on each CameraNode:
-#     refclock PPS /dev/pps0 lock NMEA refid GPS precision 1e-7
-#     refclock SHM 0 offset 0.5 delay 0.2 refid NMEA noselect
-#   (PPS gives the fine ±10-100 ns alignment at each second edge; NMEA/NTP only
-#   needs to identify which second. See PLAN.md "Time Sync Architecture".)
+# TIME SYNC:
+#   The node latches the GPS 1PPS edge in-process on the GPIO given by
+#   --pps-gpio (no /dev/pps0 or chrony refclock required). The rising edge
+#   marks the second start; frames are timestamped against the last latched
+#   edge and fall back to the system clock until the first edge arrives.
+#   Plain NTP (systemd-timesyncd) is enough for wall-clock sanity.
 #
-#   This unit starts after chrony so frame timestamps are taken on a
-#   GPS-disciplined CLOCK_REALTIME. The CameraNode PPS handler also latches
-#   edges directly and falls back to the raw system clock if PPS is absent.
+# WIRING:
+#   Carrier port User_IO1 is GPIO24. The carrier schematic labels it
+#   GPIO20 - the schematic is WRONG. Signal is active-LOW (~100 ms low
+#   pulse, idle HIGH); the app applies an internal pull-up. Production may
+#   feed 1PPS via an RS485 line receiver; same GPIO discipline applies.
 #
-# APRILTAG (optional, local target location): add to ExecStart:
-#     --apriltag --apriltag-tag-size 0.165 --camera-alias CameraNode1
-#   Poses are recorded to .taps v0x03 and published on NT table "AprilTag".
-#   See README "AprilTag Detection".
+# CAMERA (final config, 2026-10-18):
+#   Arducam UC-852, OmniVision OV9782 global shutter, USB UVC (0c45:6366),
+#   /dev/video0. MJPG at 1280x800 runs 30/60/100 fps; YUYV only 10 fps -
+#   always use MJPG. 100 fps is the certified boot mode: 100.0 Hz capture
+#   (median frame interval 9.8 ms), ~72% of frames carry valid AprilTag
+#   poses => ~73 poses/s. The detector, not USB/network/disk, is the
+#   system limit: 2 threads + quad-decimation 3 are required for that
+#   number; with defaults (1 thread, decimation 2) coverage falls to 32%.
+#   Storage at 100 fps is ~1.1-1.3 GB/min - offload regularly. Steady-state
+#   SoC ~45 C on the fanless CM5, no throttling observed; drop to -f 60 if
+#   it ever exceeds ~70 C (60 fps mode = 100% pose coverage at ~2 cores).
 #
-# CAMERA CALIBRATION: run the guided wizard at http://<camera>:8080/calibrate
-#   It performs a focus check + coverage-guided checkerboard capture, then writes
-#   intrinsics to <output>/calibration.json (override with --calibration-file).
-#   Those values are loaded at startup automatically and used for AprilTag pose
-#   estimation + .taps v0x03 headers, so --apriltag-fx/-fy/-cx/-cy are NOT needed
-#   once calibrated. Explicit CLI flags override the file; if the camera
-#   resolution changes, recalibrate.
+# APRILTAG (local target location): keep --apriltag in ExecStart. Poses are
+#   recorded to .taps v0x03 and published on NT table "AprilTag".
+#
+# POWER MODE (offline / thermal, added 2026-10-18):
+#   The node BOOTS IN LOW POWER MODE by default: /dev/video0 is never
+#   opened and AprilTag processing is idle, so an offline node sits at
+#   0% CPU / ~28 C instead of ~75% / ~45 C. The web UI, SSE, PPS time
+#   sync and NetworkTables stay fully reachable; recording start and the
+#   calibration wizard are refused (HTTP 409) until capture is enabled.
+#   Toggle: "Enter Normal Mode" / "Low Power Mode" button at
+#   http://<camera>:8080, or POST {"enable":false} to /lowpower (GET
+#   /lowpower reports state; enabling low power stops an active
+#   recording first and flushes the .taps cleanly). To restore the old
+#   always-capturing behavior, append --start-capturing to ExecStart.
+#
+# CAMERA CALIBRATION: run the guided wizard at http://<camera>:8080/calibrate.
+#   Intrinsics land in <output>/calibration.json, are loaded at startup
+#   automatically, and drive pose estimation + .taps headers. Recalibrate
+#   whenever the capture resolution changes. Current OV9782 800p set
+#   (fx 926.4 fy 925.1 cx 692.7 cy 387.5, RMS 1.68 px) is archived in
+#   config/calibrations/ in this repo.
+#
+# GPIO EXCLUSIVITY: do NOT run pps-watch.service alongside this unit - GPIO
+#   line requests are exclusive. Stop this unit before using the watcher.
+#
+# MAINTENANCE: stop with systemctl stop (SIGTERM) ONLY; TimeoutStopSec=30
+#   lets an open .taps flush. Never SIGKILL mid-stream (wedges the UVC
+#   session until physical USB replug or reboot) and allow >= 4 s between
+#   stop and relaunch.
 
 [Unit]
-Description=TaPS Camera Node
-Wants=chrony.service
-After=network-online.target chrony.service
+Description=TaPS CameraNode daemon (OV9782 UC-852, 100fps MJPG 800p, apriltag 2thr dec3)
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
-# templates/index.html and templates/calibrate.html are served relative to the
-# working directory (installed by `make install` to share/taps_camera_node/templates)
-WorkingDirectory=/usr/local/share/taps_camera_node
-ExecStart=/usr/local/bin/camera_node \
-    --camera 0 \
-    --fps 60 \
-    --width 1920 \
-    --height 1080 \
-    --fourcc MJPG \
-    --output /recordings \
-    --encoder jpeg \
-    --encoder-args "quality:85" \
-    --encoder-threads 4 \
-    --http-port 8080 \
-    --stream-quality 85 \
-    --stream-width 640 \
-    --stream-height 480 \
-    --stream-fps 15 \
-    --pps-gpio 17 \
-    --nt-server 10.0.1.X \
-    --nt-match-start RoboRIO/matchStart \
-    --nt-match-end RoboRIO/matchEnd \
-    --nt-local CameraNode1
-Restart=always
+User=dan
+WorkingDirectory=/home/dan/taps/camera_node
+# Keep OpenCV V4L2 debug spam out of the journal and /tmp
+Environment=OPENCV_VIDEOIO_DEBUG=0
+# Final config, reboot-verified on CameraNode1 (CM5, Debian 13) 2026-10-18
+ExecStart=/home/dan/taps/camera_node/build/TaPS_CameraNode \
+    -c 0 -w 1280 -h 800 -f 100 -F MJPG \
+    --apriltag --apriltag-threads=2 --apriltag-quad-decimation=3 \
+    --camera-alias CameraNode1 -o output \
+    --pps-gpio 24
+# NetworkTables triggers (enable in production; replace 10.0.1.X):
+#   --nt-server 10.0.1.X --nt-match-start RoboRIO/matchStart \
+#   --nt-match-end RoboRIO/matchEnd --nt-local CameraNode1
+Restart=on-failure
 RestartSec=5
+TimeoutStopSec=30
+KillMode=control-group
 StandardOutput=journal
 StandardError=journal
 

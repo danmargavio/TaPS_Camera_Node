@@ -78,9 +78,9 @@ TaPS_Consolidated/
 ### Prerequisites
 
 **CameraNode (Raspberry Pi):**
-- Ubuntu for Raspberry Pi (headless)
-- CMake 3.28+, GCC with C++20 support
-- OpenCV 5.0+ with V4L2 support
+- Raspberry Pi OS / Debian 13 (headless) — bench-verified on CM5, aarch64
+- CMake 3.25+, GCC with C++20 support
+- OpenCV ≥ 4.5 with V4L2 support (system package is fine)
 - spdlog, libhttpserver
 - libgpiod-dev (for GPIO/PPS)
 - Python 3 with pyntcore package (for C++ ntcore bindings)
@@ -273,10 +273,10 @@ The ServerNode provides a web interface with:
 ### CameraNode (YAML)
 ```yaml
 camera:
-  device_id: 0          # /dev/video0
-  width: 1920
-  height: 1080
-  fps: 60
+  device_id: 0          # /dev/video0 (Arducam UC-852, OV9782 global shutter)
+  width: 1280
+  height: 800           # native full sensor frame; 720 is a crop
+  fps: 100              # MJPG only - YUYV is 10 fps; see docs/SETUP_RPI.md s7
   fourcc: "MJPG"
 
 recording:
@@ -289,7 +289,12 @@ streaming:
   compose_grid: true
 
 pps:
-  gpio_pin: 17
+  # 1PPS input. On the bench carrier this is the pin labelled User_IO1, which
+  # is BCM/GPIO 24 (the carrier schematic label of GPIO20 was found to be wrong).
+  # Signal: active-LOW ~100 ms pulse, RISING edge marks the whole-second start.
+  # Internal PULL_UP is applied by the app; external driver is push-pull safe.
+  # NOTE: the CameraNode binary reads CLI flags (--pps-gpio 24), not this YAML.
+  gpio_pin: 24
 
 network_tables:
   server: "10.0.1.X"
@@ -330,6 +335,7 @@ web:
 |----------|--------|-------------|
 | `/stream` | GET | MJPEG single camera stream |
 | `/grid-stream` | GET | MJPEG 2x2 composited grid |
+| `/system` | GET | PPS stats + power/thermal snapshot (same payloads SSE pushes as `pps`/`sys`) |
 | `/status` | GET | Current status JSON |
 | `/recording` | POST | Start/stop recording (`{"action": "start/stop"}`) |
 | `/events` | GET | SSE events (status, disk, cpu, mem) |
@@ -338,6 +344,7 @@ web:
 | `/calib/status` | GET | Calibration state / focus score / coverage JSON |
 | `/calib/control` | POST | `{"action":"start|next|finish|abort|reset", ...}` |
 | `/calib/stream` | GET | MJPEG calibration view with overlays |
+| `/lowpower` | GET/POST | Power mode: GET returns `{"low_power":bool}`; POST `{"enable":true}` parks capture + AprilTag (releases the camera device), `{"enable":false}` resumes. Boot default is low power; `--start-capturing` opts out. While low power, `/recording` and `/calib/control` start are refused (HTTP 409); web UI, SSE, PPS and NetworkTables stay live. |
 
 ### ServerNode Endpoints
 
@@ -367,10 +374,10 @@ web:
 - Web frontend inspired by C++ templates/index.html
 
 ### Future Work
-- [ ] CameraNode: Implement PPS handler (pps_handler.h)
-- [ ] CameraNode: Implement NetworkTables client (nt_client.h)
-- [ ] CameraNode: Implement grid composition endpoint
+- [x] CameraNode: Implement PPS handler (pps_handler.h) — bench-verified 2026-10-03: LOCKED on live GPS 1PPS, 0 dropped edges, ~55 µs jitter; stats on /system + camera page
+- [x] CameraNode: Implement NetworkTables client (nt_client.h) — implemented; needs RoboRIO on the network to exercise match triggers
+- [x] CameraNode: Implement grid composition endpoint (/grid-stream)
 - [ ] ServerNode: Full SMB polling implementation (requires smbprotocol setup)
 - [ ] ServerNode: WebSocket session loading
-- [ ] Testing: End-to-end integration tests
+- [ ] Testing: End-to-end integration tests — node live-stream + .taps record/playback through ServerNode verified on hardware 2026-10-03; NT triggers and SMB log polling still need robot-side hardware
 - [ ] Documentation: Deployment guides for CameraNode and ServerNode

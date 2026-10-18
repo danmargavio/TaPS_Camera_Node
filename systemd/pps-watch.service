@@ -1,0 +1,32 @@
+# TaPS PPS Watcher - BENCH DIAGNOSTIC ONLY
+#
+# Runs scripts/pps_watch.sh: logs one timestamped line per rising edge of
+# the GPS 1PPS input (carrier port User_IO1 = GPIO24) via gpiomon. Useful
+# when bringing up a new GPS antenna/cable without starting CameraNode.
+#
+# GPIO lines are requested EXCLUSIVELY: this watcher cannot coexist with a
+# camera_node holding --pps-gpio 24. The script polls the flag file
+# /tmp/pps_pause every pass and yields while it exists, and backs off on
+# "Device or resource busy". Keep this unit DISABLED in production.
+#
+# Install (bench only):
+#   sudo cp systemd/pps-watch.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl start pps-watch        # start manually - do not enable
+#   journalctl -u pps-watch -f
+
+[Unit]
+Description=TaPS 1PPS edge watcher (bench diagnostic, GPIO24)
+After=multi-user.target
+
+[Service]
+Type=simple
+User=dan
+ExecStart=/home/dan/taps/camera_node/scripts/pps_watch.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

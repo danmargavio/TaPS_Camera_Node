@@ -92,7 +92,15 @@ public:
         }
     };
 
+    // Default: closed reader (assignable/movable — used by PlaybackManager
+    // containers before the file is opened with open()).
+    TaPS_Reader() = default;
+
     explicit TaPS_Reader(const fs::path &path) {
+        open(path);
+    }
+
+    void open(const fs::path &path) {
         file_stream.open(path, std::ios::binary);
         if (!file_stream.is_open()) {
             throw std::runtime_error("Failed to open file: " + path.string());

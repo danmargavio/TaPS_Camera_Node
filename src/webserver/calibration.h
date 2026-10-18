@@ -59,8 +59,9 @@ class CalibrationSession {
 public:
     // Coverage goals (tunable): each of 9 FOV cells needs kCellGoal samples;
     // each of 5 orientation categories needs kTiltGoal samples. Early finish
-    // requires at least kMinTotal frames with every cell >= 1 and >= 2 of the
-    // non-frontal categories represented.
+    // requires at least kMinTotal frames, every cell >= 1, and (>= 2 non-frontal
+    // categories represented OR every cell already at goal - complete FOV
+    // coverage is itself strong calibration evidence).
     static constexpr int kCellGoal = 5;
     static constexpr int kTiltGoal = 4;
     static constexpr int kMinTotal = 24;
@@ -87,6 +88,12 @@ public:
     // Called after a successful calibration.json write (live intrinsic update).
     static void setOnSaved(std::function<void(double fx, double fy, double cx, double cy)> cb);
 
+    // Optional hook the app wires to freeze camera auto-exposure for the
+    // duration of a calibration session: cb(true) at start, cb(false) on
+    // abort/Done/Failed. AE hunting destabilizes checkerboard corners and
+    // makes UVC stretch exposure (frame-rate dips on lighting changes).
+    static void setExposureControl(std::function<void(bool lock)> cb);
+
     // Stream plumbing (read by HttpServer's MJPEG producer, same pattern as s_latestJpeg)
     static std::mutex s_jpegMutex;
     static std::vector<uint8_t> s_latestJpeg;
@@ -110,6 +117,7 @@ private:
     static double boardFocusScore(const cv::Mat &gray, const std::vector<cv::Point2f> &corners);
 
     static void clearCollectedLocked(); // RAM points + temp dir
+    static void applyExposure(bool lock); // safe no-op when hook unset
 
     static nlohmann::json configJsonLocked();
 
@@ -159,6 +167,7 @@ private:
 
     static inline std::mutex s_cbMutex;
     static inline std::function<void(double, double, double, double)> s_onSaved;
+    static inline std::function<void(bool)> s_exposureControl;
 
     static inline cv::Size s_frameSize; // full-resolution capture size
 };
