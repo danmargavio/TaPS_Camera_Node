@@ -128,6 +128,7 @@ target_link_libraries(TaPS_CameraNode PRIVATE
 )
 
 target_include_directories(TaPS_CameraNode PRIVATE
+        ${OpenCV_INCLUDE_DIRS}
         ${LIBHTTPSERVER_INCLUDE_DIRS}
 )
 

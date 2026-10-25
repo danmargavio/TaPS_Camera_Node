@@ -10,8 +10,8 @@
 #include <gpiod.hpp>
 #endif
 
-PPSHandler::PPSHandler(int gpio_pin)
-    : gpio_pin_(gpio_pin) {
+PPSHandler::PPSHandler(std::string spec)
+    : spec_(std::move(spec)) {
     latest_pps_time_ = std::chrono::system_clock::now().time_since_epoch();
 }
 
@@ -20,15 +20,61 @@ PPSHandler::~PPSHandler() {
 }
 
 bool PPSHandler::initialize() {
-    if (gpio_pin_ < 0) {
-        spdlog::warn("PPS GPIO pin not configured (pin < 0), using system clock");
+    // Parse the --pps-gpio spec. Accepted forms:
+    //   "24"            -> gpiochip0, line 24 (legacy, Raspberry Pi BCM numbering)
+    //   "gpiochipN:L"   -> gpiochipN, line L  (multi-chip boards: RK3588 exposes
+    //                       one gpiochip per bank; the 40-pin header lives on
+    //                       gpiochip1..4, so a bare Pi-style number is wrong
+    //                       there and the explicit form must be used)
+    //   "-1" / empty    -> disabled
+    std::string spec = spec_;
+    spec.erase(0, spec.find_first_not_of(" \t\r\n"));
+    spec.erase(spec.find_last_not_of(" \t\r\n") + 1);
+
+    bool parsed = false;
+    if (spec.empty()) {
+        spec = "-1";
+    }
+    if (spec == "-1") {
+        spdlog::warn("PPS GPIO not configured (--pps-gpio -1), using system clock");
+        return false;
+    }
+
+    const auto colon = spec.find(':');
+    try {
+        if (colon == std::string::npos) {
+            const int line = std::stoi(spec);
+            if (line >= 0) {
+                chip_name_ = "gpiochip0";
+                gpio_line_ = line;
+                parsed = true;
+            }
+        } else {
+            const std::string chip = spec.substr(0, colon);
+            const int line = std::stoi(spec.substr(colon + 1));
+            if (line >= 0 && chip.rfind("gpiochip", 0) == 0) {
+                chip_name_ = chip;
+                gpio_line_ = line;
+                parsed = true;
+            }
+        }
+    } catch (const std::exception &) {
+        parsed = false;
+    }
+
+    if (!parsed) {
+        chip_name_.clear();
+        gpio_line_ = -1;
+        spdlog::warn("Invalid --pps-gpio spec '{}' - expected 'N' (gpiochip0 line) "
+                     "or 'gpiochipN:LINE' (-1 = disabled). Using system clock.",
+                     spec_);
         return false;
     }
 
 #ifdef HAVE_GPIOD
     try {
-        // Open the GPIO chip (GPIOs on gpiochip0 for BCM pins on Pi).
-        chip_ = std::make_unique<gpiod::chip>("/dev/gpiochip0");
+        // Open the GPIO chip selected by the spec.
+        chip_ = std::make_unique<gpiod::chip>("/dev/" + chip_name_);
 
         // Rising-edge events timestamped by the kernel CLOCK_REALTIME —
         // disciplined by chrony once the GPS PPS source is configured.
@@ -44,10 +90,10 @@ bool PPSHandler::initialize() {
             chip_->prepare_request()
                 .set_consumer("taps_camera")
                 .set_event_buffer_size(1024)
-                .add_line_settings(static_cast<unsigned int>(gpio_pin_), settings)
+                .add_line_settings(static_cast<unsigned int>(gpio_line_), settings)
                 .do_request());
 
-        spdlog::info("PPS handler initialized on gpiochip0 line {}", gpio_pin_);
+        spdlog::info("PPS handler initialized on {} line {}", chip_name_, gpio_line_);
         pps_available_ = true;
         running_ = true;
         monitor_thread_ = std::thread(&PPSHandler::pps_monitor_loop, this);
@@ -178,13 +224,14 @@ void PPSHandler::pps_monitor_loop() {
 
 PPSHandler::Stats PPSHandler::stats() const {
     Stats st;
-    st.configured = gpio_pin_ >= 0;
+    st.configured = gpio_line_ >= 0;
     st.available = pps_available_.load();
     st.edges = edge_count_.load(std::memory_order_relaxed);
     st.dropouts = dropout_count_.load(std::memory_order_relaxed);
     st.period_ms = ema_period_ms_.load(std::memory_order_relaxed);
     st.jitter_us = ema_jitter_us_.load(std::memory_order_relaxed);
-    st.pin = gpio_pin_;
+    st.pin = gpio_line_;
+    st.chip = chip_name_;
     st.ever_locked = have_edge_.load();
     if (have_edge_.load()) {
         std::lock_guard<std::mutex> lock(pps_mutex_);

@@ -1,0 +1,28 @@
+[Unit]
+Description=TaPS CameraNode daemon (Orange Pi 5 Plus, OV9782, 100fps MJPG 800p, apriltag 2thr dec3)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=dan
+WorkingDirectory=/home/dan/taps/build
+# Critical: IndexResource/CalibratePageResource read templates/*.html relative
+# to CWD; templates/ and output/ must live under WorkingDirectory.
+# OPENCV_VIDEOIO_DEBUG=0 keeps V4L2 spam out of the journal (it once wrote
+# 181 MB on a full card).
+Environment=OPENCV_VIDEOIO_DEBUG=0
+ExecStart=/home/dan/taps/build/TaPS_CameraNode \
+    -c 0 -w 1280 -h 800 -f 100 -F MJPG \
+    --apriltag --apriltag-threads=2 --apriltag-quad-decimation=3 \
+    --camera-alias CameraNode1 -o output \
+    --pps-gpio gpiochip1:4
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

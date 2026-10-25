@@ -1,7 +1,7 @@
 //
 // PPS (Pulse Per Second) GPIO Handler
 //
-// Reads GPIO pin for 1 PPS signal using libgpiod v2 (character device API).
+// Reads GPIO line for 1 PPS signal using libgpiod v2 (character device API).
 // On each rising edge, records the kernel REALTIME timestamp, which is
 // disciplined by chrony against the GPS PPS source.
 //
@@ -14,6 +14,7 @@
 #include <thread>
 #include <memory>
 #include <mutex>
+#include <string>
 
 #ifdef HAVE_GPIOD
 #include <gpiod.hpp>
@@ -21,7 +22,11 @@
 
 class PPSHandler {
 public:
-    explicit PPSHandler(int gpio_pin);
+    // GPIO spec forms (parsed in initialize()):
+    //   "24"           -> gpiochip0, line 24  (legacy, Raspberry Pi BCM numbering)
+    //   "gpiochipN:L"  -> gpiochipN, line L   (multi-chip boards, e.g. RK3588 banks)
+    //   "-1"           -> disabled (system-clock timestamps)
+    explicit PPSHandler(std::string spec);
     ~PPSHandler();
 
     // Request the GPIO line for rising-edge events.
@@ -42,7 +47,7 @@ public:
 
     // Snapshot for the web frontend (/system endpoint + SSE)
     struct Stats {
-        bool configured = false;   // a --pps-gpio pin was requested
+        bool configured = false;   // a valid --pps-gpio spec was requested
         bool available = false;    // GPIO line acquired
         bool locked = false;       // an edge arrived within the last 2.5 s
         bool ever_locked = false;  // at least one edge since startup
@@ -51,7 +56,8 @@ public:
         double since_edge_s = -1;  // seconds since last edge (-1 = none yet)
         double period_ms = 0;      // smoothed measured 1PPS period (0 = no data)
         double jitter_us = 0;      // smoothed |period - 1 s| in microseconds
-        int pin = -1;
+        int pin = -1;              // line number within the chip
+        std::string chip;          // parsed chip name (empty = not configured)
     };
     Stats stats() const;
 
@@ -59,7 +65,9 @@ private:
     // Background thread that monitors PPS rising edges
     void pps_monitor_loop();
 
-    int gpio_pin_;
+    std::string spec_ = "-1";      // raw --pps-gpio argument
+    std::string chip_name_;        // parsed chip name (set by initialize)
+    int gpio_line_ = -1;           // parsed line number (-1 = disabled/unparsed)
     std::atomic<bool> running_{false};
     std::atomic<bool> pps_available_{false};
     std::atomic<uint64_t> edge_count_{0};

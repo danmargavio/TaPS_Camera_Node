@@ -42,10 +42,11 @@ using json = nlohmann::json;
 class HttpServer {
 public:
     static void begin(VideoBuffer<TimestampedFrame> *frameBuffer, const RuntimeArgs &flags,
-                      const PPSHandler *pps = nullptr) {
+                      const PPSHandler *pps = nullptr, const AprilTagDetector *at = nullptr) {
         s_dataPath = flags.outputDir.empty() ? "/" : flags.outputDir;
         s_frameBuffer = frameBuffer;
         s_pps = pps;
+        s_at = at;
 
         s_previewWidth = flags.jpegStreamWidth;
         s_previewHeight = flags.jpegStreamHeight;
@@ -230,6 +231,16 @@ private:
                     {"f", availKb * 1024}, {"p", pct}};
     }
 
+    // AprilTag diagnostics: pipeline throughput (bc = detection batches
+    // completed) and cumulative tags seen (td). Rates are caller-side deltas.
+    static json buildApriltagPayload() {
+        if (!s_at)
+            return json{{"en", false}};
+        return json{{"en", s_at->is_running()},
+                    {"bc", s_at->batchesCompleted()},
+                    {"td", s_at->tagsDetectedTotal()}};
+    }
+
     static json buildPpsPayload() {
         if (!s_pps)
             return json{{"en", false}};
@@ -241,6 +252,7 @@ private:
         j["e"] = st.edges;
         j["d"] = st.dropouts;
         j["g"] = st.pin;
+        if (!st.chip.empty()) j["gc"] = st.chip;
         if (st.since_edge_s >= 0) j["s"] = std::round(st.since_edge_s * 10.0) / 10.0;
         if (st.period_ms > 0) {
             j["p"] = std::round(st.period_ms * 100.0) / 100.0;
@@ -374,6 +386,7 @@ private:
 
     static inline VideoBuffer<TimestampedFrame> *s_frameBuffer = nullptr;
     static inline const PPSHandler *s_pps = nullptr;
+    static inline const AprilTagDetector *s_at = nullptr;
     static inline std::atomic<bool> s_running{false};
     static inline std::thread s_encodeThread;
     static inline std::thread s_gridThread;
@@ -599,7 +612,8 @@ private:
     class SystemResource : public http_resource {
     public:
         http_response render_get(const http_request &) override {
-            return jsonResponse(json{{"pps", buildPpsPayload()}, {"sys", buildSysPayload()}});
+            return jsonResponse(json{{"pps", buildPpsPayload()}, {"sys", buildSysPayload()},
+                                    {"at", buildApriltagPayload()}});
         }
     };
 

@@ -326,6 +326,8 @@ private:
                                                  const std::string &encoderArgsStr,
                                                  const unsigned numEncoders) {
         auto session = std::make_unique<Session>();
+        std::error_code ecDir;
+        fs::create_directories(outputDir, ecDir);  // fresh installs may lack it
         session->outputFile = makeOutputPath(outputDir);
         session->encoderType = encoderType;
         session->numEncoders = numEncoders;

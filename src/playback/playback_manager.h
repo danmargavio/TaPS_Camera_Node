@@ -10,7 +10,7 @@
 #include <memory>
 #include <thread>
 #include <atomic>
-#include <opencv2/opencv.hpp>
+#include <opencv2/core.hpp>
 #include <filesystem>
 
 #include "../taps_reader/taps_reader.h"

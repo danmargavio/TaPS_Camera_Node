@@ -41,7 +41,11 @@ struct RuntimeArgs {
     unsigned long jpegStreamHeight = 480;
 
     // PPS / GPIO settings (NEW)
-    int ppsGpioPin = -1; // GPIO pin for 1 PPS signal (-1 = disabled)
+    // Accepted spec forms (see PPSHandler::initialize):
+    //   "24"           -> gpiochip0, line 24  (legacy, Raspberry Pi BCM numbering)
+    //   "gpiochip1:14" -> gpiochip1, line 14  (RK3588: one gpiochip per bank)
+    //   "-1"           -> disabled
+    std::string ppsGpioSpec = "-1";
 
     // NetworkTables settings (NEW)
     std::string ntServerAddress; // e.g., "10.0.1.X"

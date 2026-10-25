@@ -96,8 +96,10 @@ int main(const int argc, char *argv[]) {
                                    flags.gridPreviewHeight);
 
     // NEW: PPS/GPIO flag
-    args::ValueFlag ppsGpioFlag(parser, "pin", "GPIO pin for 1 PPS signal (-1 = disabled)", {"pps-gpio"},
-                                flags.ppsGpioPin);
+    // Spec: "24" = gpiochip0 line 24 (Pi-style), or "gpiochipN:LINE"
+    // for multi-chip boards (RK3588 etc.). -1 disables.
+    args::ValueFlag ppsGpioFlag(parser, "spec", "GPIO for 1 PPS: N (gpiochip0 line) or gpiochipN:LINE (-1 = disabled)", {"pps-gpio"},
+                                flags.ppsGpioSpec);
 
     // NEW: NetworkTables flags
     args::ValueFlag ntServerFlag(parser, "address", "NetworkTables server address", {"nt-server"},
@@ -198,7 +200,7 @@ int main(const int argc, char *argv[]) {
     flags.gridPreviewHeight = args::get(gridHeightFlag);
 
     // NEW: PPS GPIO
-    flags.ppsGpioPin = args::get(ppsGpioFlag);
+    flags.ppsGpioSpec = args::get(ppsGpioFlag);
 
     // NEW: NetworkTables
     flags.ntServerAddress = args::get(ntServerFlag);
@@ -232,7 +234,7 @@ int main(const int argc, char *argv[]) {
     spdlog::info("Starting TaPS Camera Node");
 
     // Initialize PPS handler
-    PPSHandler ppsHandler(flags.ppsGpioPin);
+    PPSHandler ppsHandler(flags.ppsGpioSpec);
     g_ppsHandler = &ppsHandler;
     bool pps_available = ppsHandler.initialize();
     if (pps_available) {
@@ -390,7 +392,7 @@ int main(const int argc, char *argv[]) {
     VideoRecordThread::setAprilTagDetector(&apriltagDetector);
 
     // Start HTTP server
-    HttpServer::begin(&frameBufferStream, flags, &ppsHandler);
+    HttpServer::begin(&frameBufferStream, flags, &ppsHandler, &apriltagDetector);
 
     std::signal(SIGINT, [](const int sig) {
         std::cout << "\n";
