@@ -5,11 +5,15 @@ and board-agnostic** - one binary, one repo; this folder holds only what
 differs: PPS GPIO mapping guidance, setup notes, and the bench checkout
 script.
 
-> STATUS 2026-10-25: FULLY VERIFIED on the bench (Armbian 26.8 vendor,
-> RK3588, OV9782 USB, GPS 1PPS wired to pin 11). Native build boots, cold
-> power-cycle survives, live 1PPS locks with ~7 us jitter (1000.0 ms
-> period), low-power toggle + record cycle writes valid .taps, web UI on
-> 8080. Hostname `cameranode1` + mDNS: reach as `cameranode1.local`.
+> STATUS 2026-10-27: FULLY VERIFIED on the bench (Armbian 26.8 vendor,
+> RK3588, OV9782 USB, GPS 1PPS wired to pin 11), now running from a
+> 119 GB **NVMe root** (cloned from the SD card, resized, re-tested).
+> Native build boots, cold power-cycle survives, live 1PPS locks with
+> ~7 us jitter (1000.0 ms period), low-power toggle + record cycle
+> writes valid .taps, web UI on 8080. `camera_node.service` (see
+> `camera_node_opi.service` in this folder) installed + enabled and
+> came up by itself on the NVMe boot. Hostname `cameranode1` + mDNS:
+> reach as `cameranode1.local`.
 
 ## Base image
 
@@ -127,9 +131,14 @@ mkdir b && cd b
 make -j8 && sudo make install && sudo ldconfig
 ```
 
-Disk note: on a 3.5 GB root this is tight but sufficient (keep ~400 MB free
-via `sudo apt-get clean` after installs and deleting the source build trees
-post-install). Recordings must NOT land on a card this size.
+Disk note: on a 3.5 GB root this is tight and **was** the bench failure
+mode: a single `apt-get install python3-opencv` (with recommends -> libvtk,
+Qt) filled the card to 0 bytes mid-unpack and wedged dpkg in uninterruptible
+I/O; recovery required kill-by-PID, archive purge, `dpkg --configure -a`,
+and streaming the snapshot off the card over ssh (no writes). Two permanent
+rules from that incident: **always `--no-install-recommends`** and `df` gate
+before any install on a small root. Recordings must NEVER land on a card
+this size - production runs from NVMe (see Storage below).
 
 Then the usual `cmake -B build && cmake --build build -j8`. The CMakeLists
 now lists `${OpenCV_INCLUDE_DIRS}` explicitly on TaPS_CameraNode - a latent
@@ -138,9 +147,27 @@ paths, which the shim (correctly) does not provide.
 
 ## Service and ports
 
-camera_node serves its web UI on **8080** (8090 is ServerNode). Reuse the
-systemd service unchanged except ExecStart `--pps-gpio gpiochip1:4` (or the
-selected pin). Low-power boot default confirmed active on this board.
+camera_node serves its web UI on **8080** (8090 is ServerNode). This folder
+ships `camera_node_opi.service` - the verified unit, installed as
+`/etc/systemd/system/camera_node.service`, enabled. Key points:
+`WorkingDirectory=/home/dan/taps/build` (templates/ and output/ are
+CWD-relative), `Environment=OPENCV_VIDEOIO_DEBUG=0` (V4L2 debug spam once
+wrote 181 MB to a full card via the manual nohup log), and ExecStart
+`--pps-gpio gpiochip1:4`. Low-power boot default confirmed active; on the
+NVMe boot the unit started itself and reached PPS-lock + calibration-load
+with zero manual steps.
+
+## Storage: NVMe migration (production layout)
+
+Bench history: 4 GB SD (dev, incident above) -> cloned to 119 GB NVMe via
+Armbian's copy-to-NVMe, partition resized, board re-tested 2026-10-27 (all
+endpoints healthy; ssh host key changed with the reinstall - clean stale
+`known_hosts` entries with `ssh-keygen -r cameranode1.local` on clients).
+Snapshots taken pre-migration live off-board: source tree, CMake cache,
+calibration, templates, authorized_keys, OpenCV shim, full `dpkg
+--get-selections`. Recordings at production settings run 2.5 MB/s+; on
+NVMe that is ~2 GB/min sustained and no longer a gating concern, though
+regular offload remains policy.
 
 ## Checkout script
 

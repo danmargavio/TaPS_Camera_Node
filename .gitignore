@@ -1,3 +1,20 @@
 __pycache__/
 *.pyc
 build*/
+
+# runtime artifacts - never belong in git
+output/
+recordings/
+*.taps
+
+# SSH/TLS material and local overrides (policy: no credentials in repos)
+*.key
+*.pem
+id_*
+known_hosts*
+*.local.yaml
+*.local.yml
+
+# bench debris
+*.log
+live_frame*.jpg
